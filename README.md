@@ -12,7 +12,7 @@
 
 ## 1. 项目目标
 
-传统工业质检通常依赖人工目检或基于固定规则的机器视觉系统，存在以下问题：
+传统工业质检通常依赖人工目检或固定规则机器视觉系统，存在以下问题：
 
 | 挑战 | 说明 |
 |---|---|
@@ -22,7 +22,7 @@
 | 异常类型异质 | 外观、颜色、几何、组件、装配和时序异常不能由单一分数完整描述 |
 | 用户反馈更新存在风险 | 直接在线更新容易造成模型漂移和正常模式污染 |
 
-本项目采用多尺度视觉特征、开放集异常训练、目标产线少样本适配、异质异常增强和反馈安全更新，构建完整 AOI 检测流程。
+本项目采用 ConvNeXt 多尺度视觉特征、开放集异常训练、目标产线少样本适配、异质异常增强和反馈安全更新，构建完整的 AOI 检测流程。
 
 题目描述：
 
@@ -44,7 +44,7 @@
 - 完成迁移后，在后续 1000+ 测试样本上冻结模型；
 - 测试数据不加入训练集，不更新模型参数；
 - 用户反馈只在独立更新阶段使用；
-- 反馈更新后的模型必须经过历史回放、验证和回滚检查后再发布。
+- 反馈模型必须通过历史回放、验证和回滚检查后再发布。
 
 ---
 
@@ -135,7 +135,7 @@ ConvNeXtV2-Tiny-384
 B × 3 × 384 × 384
 ```
 
-核心特征：
+核心多尺度特征：
 
 ```text
 F16：B × 384 × 24 × 24
@@ -145,10 +145,10 @@ F32：B × 768 × 12 × 12
 当前使用 ConvNeXtV2-Tiny 的原因：
 
 - 参数量较小；
-- 当前代码和预训练权重已经跑通；
-- 已完成目标迁移和实际延迟测试；
+- 预训练权重已经成功加载；
+- 已完成公共训练、目标迁移和实际延迟测试；
 - 适合 RTX 2060 等低算力设备；
-- 能为后续局部异常、结构异常和视频逻辑分支保留计算预算。
+- 能为局部检测、全局检测和视频逻辑分支保留计算预算。
 
 ### 5.2 ConvNeXt-L 的定位
 
@@ -164,9 +164,9 @@ ConvNeXt-L 后续可用于：
 - 教师模型；
 - 特征蒸馏；
 - 与 ConvNeXtV2-Tiny 进行精度对比；
-- 验证更大骨干是否能进一步提升未见异常泛化。
+- 验证更大骨干是否能够提升未见异常泛化。
 
-当前实验结果均来自 ConvNeXtV2-Tiny，不能将 ConvNeXt-L 的效果或速度作为已验证结果。
+当前实测结果均来自 ConvNeXtV2-Tiny，不能将 ConvNeXt-L 的精度或延迟作为已验证结果。
 
 ---
 
@@ -178,13 +178,11 @@ F16 和 F32 是当前方案不可删除的两条核心分支。
 
 F16 特征尺寸：
 
-```math
-F_{16}
-\in
-\mathbb{R}^{B\times384\times24\times24}
+```text
+F16 ∈ R^(B × 384 × 24 × 24)
 ```
 
-F16 具有较高的空间分辨率，主要处理：
+F16 具有较高空间分辨率，主要处理：
 
 - 划痕；
 - 裂纹；
@@ -209,10 +207,8 @@ F16
 
 F32 特征尺寸：
 
-```math
-F_{32}
-\in
-\mathbb{R}^{B\times768\times12\times12}
+```text
+F32 ∈ R^(B × 768 × 12 × 12)
 ```
 
 F32 具有更大的感受野，主要处理：
@@ -303,19 +299,19 @@ F16 局部 Token
 | 颜色参考 | LAB 颜色统计 | Ledoit-Wolf + Mahalanobis |
 | 几何参考 | 边缘和轮廓特征 | Ledoit-Wolf + Mahalanobis |
 
-GPU 最近邻计算使用：
+GPU 最近邻距离使用以下等价分解：
 
-```math
-\lVert x-y\rVert_2^2
+```text
+distance²(x, y)
 =
-\lVert x\rVert_2^2
+||x||²
 +
-\lVert y\rVert_2^2
+||y||²
 -
-2xy^\top
+2 × x · y
 ```
 
-并采用分块矩阵乘法降低显存占用：
+对应代码：
 
 ```python
 for start in range(0, bank.shape[0], chunk_size):
@@ -340,7 +336,7 @@ for start in range(0, bank.shape[0], chunk_size):
 
 但是，局部 Token 记忆库属于非参数检索方法，需要额外保存目标产品的正常局部特征，因此不作为最终模型的核心算法。
 
-当前记忆库版本保留为：
+当前版本保留为：
 
 ```text
 Memory-bank Baseline
@@ -364,33 +360,35 @@ LNBR
 
 ### 9.1 F16 Token 展开
 
-F16 展开为：
+F16 特征图空间尺寸为 24×24，因此每张图片包含：
 
-```math
-Z_{16}
-\in
-\mathbb{R}^{B\times576\times384}
+```text
+24 × 24 = 576 个局部 Token
+```
+
+展开后的形状：
+
+```text
+Z16 ∈ R^(B × 576 × 384)
 ```
 
 其中：
 
-```math
-576
-=
-24\times24
-```
+- `B`：批次大小；
+- `576`：局部 Token 数量；
+- `384`：每个 Token 的通道维度。
 
 ### 9.2 可学习正常基
 
 模型内部维护可训练正常基：
 
-```math
-B_{16}
-\in
-\mathbb{R}^{K\times384}
+```text
+B16 ∈ R^(K × 384)
 ```
 
-其中 $K$ 可设置为 16、32 或 64。
+其中 `K` 可以设置为 16、32 或 64。
+
+代码示例：
 
 ```python
 self.normal_basis_f16 = nn.Parameter(
@@ -404,144 +402,182 @@ self.normal_basis_f16 = nn.Parameter(
 - 保存到 `target_model.pth`；
 - 参数量固定；
 - 推理时不读取外部局部特征库；
-- 反馈后通过轻量微调更新；
+- 用户反馈后通过轻量微调更新；
 - 与卷积核和全连接层权重具有相同的参数属性。
 
 ### 9.3 正常基软分配
 
-首先对局部 Token 和正常基进行归一化：
+首先对局部 Token 和正常基进行 L2 归一化：
 
-```math
-\bar Z_{16}
-=
-\operatorname{Norm}(Z_{16})
+```text
+Z16_norm = L2Normalize(Z16)
+B16_norm = L2Normalize(B16)
 ```
 
-```math
-\bar B_{16}
+计算局部 Token 和每个正常基之间的相似度：
+
+```text
+similarity
 =
-\operatorname{Norm}(B_{16})
+Z16_norm × transpose(B16_norm)
 ```
 
-软分配矩阵：
+加入温度参数：
 
-```math
+```text
+scaled_similarity
+=
+similarity / temperature
+```
+
+通过 Softmax 获得软分配矩阵：
+
+```text
 A
 =
-\operatorname{softmax}
-\left(
-\frac{
-\bar Z_{16}
-\bar B_{16}^{\top}
-}{
-\tau
-}
-\right)
+Softmax(scaled_similarity)
+```
+
+分配矩阵形状：
+
+```text
+A ∈ R^(B × 576 × K)
+```
+
+含义：
+
+- `A[b, i, k]` 表示第 `b` 张图片的第 `i` 个局部 Token 对第 `k` 个正常基的分配权重；
+- 每个 Token 对所有正常基的权重和为 1；
+- 温度越小，分配越接近硬聚类；
+- 温度越大，分配越平滑。
+
+### 9.4 正常特征重构
+
+使用正常基对局部特征进行重构：
+
+```text
+Z16_hat
+=
+A × B16
 ```
 
 其中：
 
-```math
-A
-\in
-\mathbb{R}^{B\times576\times K}
+```text
+Z16_hat ∈ R^(B × 576 × 384)
 ```
 
-$\tau$ 是正常基分配温度。
+每个局部 Token 的重构残差：
 
-### 9.4 正常特征重构
-
-使用正常基重构 F16 局部特征：
-
-```math
-\hat Z_{16}
+```text
+R16[i]
 =
-A B_{16}
+L2Distance(
+    Z16[i],
+    Z16_hat[i]
+)
 ```
 
-局部残差：
+也可以写为：
 
-```math
-R_{16,i}
+```text
+R16[i]
 =
-\left\lVert
-Z_{16,i}
--
-\hat Z_{16,i}
-\right\rVert_2
+sqrt(
+    sum(
+        (Z16[i] - Z16_hat[i])²
+    )
+)
 ```
 
 正常区域应具有较低残差，异常区域应具有较高残差。
 
 ### 9.5 局部异常图
 
-将局部残差恢复为空间形式：
+将 576 个局部残差恢复为 24×24 空间形式：
 
-```math
-M_{16}
-\in
-\mathbb{R}^{B\times1\times24\times24}
+```text
+M16 ∈ R^(B × 1 × 24 × 24)
 ```
 
-图像级局部异常分数：
+图像级局部异常分数采用最高残差区域的平均值：
 
-```math
-s_{16}
+```text
+s16
 =
-\operatorname{MeanTopK}
-\left(
-R_{16}
-\right)
+Mean(
+    TopK(R16)
+)
 ```
+
+其中 Top-K 比例由配置项控制：
+
+```text
+local_top_ratio
+```
+
+该分数主要反映图像中最异常的少量局部区域。
 
 ### 9.6 正常区域压缩
 
-低残差正常 Token 按正常基进行聚合：
+低残差正常 Token 按正常基进行加权聚合。
 
-```math
-C_k
+第 `k` 个正常聚合 Token：
+
+```text
+C[k]
 =
-\frac{
-\sum_i A_{ik}Z_{16,i}
-}{
-\sum_i A_{ik}
-+
-\varepsilon
-}
+sum_i(
+    A[i, k] × Z16[i]
+)
+/
+(
+    sum_i(
+        A[i, k]
+    )
+    +
+    epsilon
+)
 ```
 
 最终得到：
 
-```math
-C
-\in
-\mathbb{R}^{B\times K\times384}
+```text
+C ∈ R^(B × K × 384)
 ```
 
-大面积重复正常区域被压缩为 $K$ 个正常聚合 Token。
+含义：
+
+- 原始 F16 有 576 个局部 Token；
+- 大量重复正常区域按正常基聚合；
+- 最终压缩为固定数量的 `K` 个正常聚合 Token；
+- 不再对所有正常位置进行高开销全局建模。
 
 ### 9.7 高残差 Token 保留
 
-根据局部残差选择 Top-$M$ 个疑似异常 Token：
+根据局部残差选择 Top-M 个疑似异常 Token：
 
-```math
-I_{\mathrm{abnormal}}
+```text
+abnormal_indices
 =
-\operatorname{TopM}
-\left(
-R_{16}
-\right)
+TopMIndices(R16)
 ```
 
-对应特征：
+保留对应原始特征：
 
-```math
-Z_{\mathrm{abnormal}}
+```text
+Z_abnormal
 =
-Z_{16}
-\left[
-I_{\mathrm{abnormal}}
-\right]
+Gather(
+    Z16,
+    abnormal_indices
+)
+```
+
+形状：
+
+```text
+Z_abnormal ∈ R^(B × M × 384)
 ```
 
 例如：
@@ -557,72 +593,130 @@ I_{\mathrm{abnormal}}
 - 压缩大面积重复正常区域；
 - 降低后续全局建模开销；
 - 防止小缺陷被全局平均池化；
-- 保留疑似异常区域的细粒度信息。
+- 保留疑似异常位置的细粒度特征。
 
 ### 9.8 LNBR 训练损失
 
-正常重构损失：
+#### 正常重构损失
 
-```math
-L_{\mathrm{normal}}
+正常图片的局部 Token 应能被正常基解释：
+
+```text
+L_normal
 =
-\frac{1}{N}
-\sum_i
-R_{16,i}
+Mean(R16_normal)
 ```
 
-正常基多样性损失：
+目标：
 
-```math
-L_{\mathrm{div}}
-=
-\left\lVert
-\bar B_{16}
-\bar B_{16}^{\top}
--
-I
-\right\rVert_F^2
+```text
+正常样本残差尽可能低
 ```
 
-分配均衡损失：
+#### 正常基多样性损失
 
-```math
-L_{\mathrm{balance}}
+防止多个正常基退化为相同向量：
+
+```text
+basis_similarity
 =
-\left\lVert
-\operatorname{Mean}_{B,N}(A)
--
-\frac{1}{K}
-\right\rVert_2^2
+B16_norm × transpose(B16_norm)
 ```
 
-异常间隔损失：
-
-```math
-L_{\mathrm{margin}}
+```text
+L_div
 =
-\max
-\left(
-0,
-m_a-s_{16}^{a}
-\right)
+MeanSquaredError(
+    basis_similarity,
+    IdentityMatrix
+)
+```
+
+目标：
+
+```text
+不同正常基学习不同的正常局部模式
+```
+
+#### 分配均衡损失
+
+防止所有局部 Token 都分配到同一个正常基：
+
+```text
+mean_assignment
+=
+Mean(A, dimensions=[batch, token])
+```
+
+```text
+target_assignment
+=
+1 / K
+```
+
+```text
+L_balance
+=
+MeanSquaredError(
+    mean_assignment,
+    target_assignment
+)
+```
+
+#### 异常间隔损失
+
+对于异常图片：
+
+```text
+L_abnormal
+=
+max(
+    0,
+    abnormal_margin - s16_abnormal
+)
+```
+
+对于正常图片：
+
+```text
+L_normal_margin
+=
+max(
+    0,
+    s16_normal - normal_margin
+)
+```
+
+联合间隔损失：
+
+```text
+L_margin
+=
+L_abnormal
 +
-\max
-\left(
-0,
-s_{16}^{n}-m_n
-\right)
+L_normal_margin
 ```
 
-具有异常 Mask 时增加：
+目标：
 
-```math
-L_{\mathrm{map}}
+```text
+正常样本局部残差低
+异常样本局部残差高
+```
+
+#### 异常 Mask 监督
+
+当合成异常或公开数据集提供异常 Mask 时：
+
+```text
+L_map
 =
-L_{\mathrm{BCE}}
+BCE(residual_map, anomaly_mask)
 +
-L_{\mathrm{Dice}}
+DiceLoss(residual_map, anomaly_mask)
 ```
+
+该损失用于让高残差区域与真实缺陷区域对齐。
 
 ---
 
@@ -662,7 +756,7 @@ F32 Token
 - 低秩关系建模；
 - 轻量状态空间模块。
 
-该模块的主要目标是：
+该模块的主要目标：
 
 - 将 F16 局部异常证据传递到 F32 全局结构表示；
 - 保留小面积高残差区域；
@@ -679,59 +773,52 @@ F32 Token
 
 F32 全局池化：
 
-```math
-g_{32}
+```text
+g32
 =
-\operatorname{GAP}
-\left(
-F_{32}
-\right)
+GlobalAveragePooling(F32)
 ```
 
 通过映射层降维：
 
-```math
-h_{32}
+```text
+h32
 =
-W_g g_{32}
+Linear(g32)
 ```
 
 模型内部维护：
 
-```math
-\mu_{32}
-\in
-\mathbb{R}^{d}
+```text
+global_normal_mean
+global_normal_log_variance
 ```
 
-```math
-\log\sigma_{32}^{2}
-\in
-\mathbb{R}^{d}
+形状：
+
+```text
+global_normal_mean ∈ R^d
+global_normal_log_variance ∈ R^d
 ```
 
 全局正常能量：
 
-```math
-s_{32}
+```text
+variance
 =
-\sum_j
-\left[
-\frac{
-\left(
-h_{32,j}-\mu_{32,j}
-\right)^2
-}{
-\exp
-\left(
-\log\sigma_{32,j}^{2}
-\right)
+exp(global_normal_log_variance)
 +
-\varepsilon
-}
-+
-\log\sigma_{32,j}^{2}
-\right]
+epsilon
+```
+
+```text
+global_energy
+=
+sum(
+    (h32 - global_normal_mean)² / variance
+    +
+    global_normal_log_variance
+)
 ```
 
 该分支主要处理：
@@ -743,35 +830,24 @@ h_{32,j}-\mu_{32,j}
 - 组件组合异常；
 - 整体颜色和分布变化。
 
-最终 F32 正常性参数同样保存到 `target_model.pth`，不依赖高维外部特征库。
+最终 F32 正常性参数保存到 `target_model.pth`，不依赖高维外部特征库。
 
 ---
 
 ## 12. 多分支融合
 
-最终融合输入包括：
+最终融合输入：
 
-```math
-v
-=
-[
-s_{16},
-s_{32},
-s_{\mathrm{cls}},
-s_{\mathrm{component}},
-s_{\mathrm{geometry}},
-s_{\mathrm{color}}
+```text
+fusion_features = [
+    f16_residual_score,
+    f32_global_energy,
+    supervised_classification_score,
+    component_anomaly_score,
+    geometry_anomaly_score,
+    color_anomaly_score,
 ]
 ```
-
-其中：
-
-- $s_{16}$：F16 局部残差分数；
-- $s_{32}$：F32 全局正常能量；
-- $s_{\mathrm{cls}}$：监督异常分类分数；
-- $s_{\mathrm{component}}$：组件异常分数；
-- $s_{\mathrm{geometry}}$：几何异常分数；
-- $s_{\mathrm{color}}$：颜色异常分数。
 
 融合器示例：
 
@@ -787,16 +863,18 @@ self.fusion_head = nn.Sequential(
 
 最终异常分数：
 
-```math
-s_{\mathrm{final}}
+```text
+final_score
 =
-H_{\mathrm{fusion}}
-\left(
-v
-\right)
+fusion_head(fusion_features)
 ```
 
-融合头主要由 100 张正常和 30 张异常进行目标产线校准。
+融合头主要由：
+
+- 100 张正常样本；
+- 30 张异常样本；
+
+进行目标产线校准。
 
 ---
 
@@ -839,11 +917,15 @@ query_seen_anomaly
 query_unseen_anomaly
 ```
 
-该训练用于模拟新产线少样本启动。
+该训练用于模拟新产线的少样本启动过程。
 
-本项目不采用额外的 MAML 或 Reptile 模型，也不生成独立的 `meta_model.pth`。
+本项目不采用额外的 MAML 或 Reptile 模型，也不生成独立的：
 
-训练流程：
+```text
+meta_model.pth
+```
+
+计划训练流程：
 
 ```text
 阶段 A：普通公共工业预训练
@@ -924,13 +1006,13 @@ Step 4：仅使用真实样本进行收尾校准
 }
 ```
 
-GAN 的定位是：
+GAN 的定位：
 
 > 扩大 30 张真实异常无法覆盖的缺陷空间，而不是替代真实异常样本。
 
 当前规则合成已经接入基础训练流程。
 
-DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未实际完成实验前不作为已验证模块。
+DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实实验前不作为已验证模块。
 
 ---
 
@@ -1054,7 +1136,7 @@ threshold = sorted_scores[rank]
 - 轻量时序 Transformer；
 - 显式状态转移模型。
 
-需要的视频标签包括：
+需要的视频标签：
 
 ```text
 正常工序序列
@@ -1092,14 +1174,12 @@ threshold = sorted_scores[rank]
 
 阈值采用平滑更新：
 
-```math
-T_{\mathrm{new}}
+```text
+new_threshold
 =
-(1-\eta)
-T_{\mathrm{old}}
+(1 - update_rate) × old_threshold
 +
-\eta
-T_{\mathrm{candidate}}
+update_rate × candidate_threshold
 ```
 
 同时限制单次相对变化幅度。
@@ -1576,16 +1656,14 @@ F32 全局结构与装配建模
 
 核心结构：
 
-```math
-\boxed{
-\text{F16 局部正常性建模}
+```text
+F16 局部正常性建模
 +
-\text{F32 全局结构建模}
+F32 全局结构建模
 +
-\text{开放集少样本迁移}
+开放集少样本迁移
 +
-\text{反馈闭环}
-}
+用户反馈闭环
 ```
 
 ---
