@@ -1,1 +1,2 @@
+convnext_large_22k_1k_224.pth
 convnextv2_tiny_22k_384_ema.pt
