@@ -22,7 +22,7 @@
 | 异常类型异质 | 外观、颜色、几何、组件、装配和时序异常不能由单一分数完整描述 |
 | 用户反馈更新存在风险 | 直接在线更新容易造成模型漂移和正常模式污染 |
 
-本项目采用 ConvNeXt 多尺度视觉特征、开放集异常训练、目标产线少样本适配、异质异常增强和反馈安全更新，构建完整的 AOI 检测流程。
+本项目采用 ConvNeXt 多尺度特征、开放集异常训练、目标产线少样本适配、异质异常增强和反馈安全更新，构建完整的 AOI 检测流程。
 
 题目描述：
 
@@ -38,13 +38,11 @@
 - 原始工业图像分辨率可达到约 2500×2500；
 - RTX 2060 或以下 GPU 单图推理目标小于 200 ms；
 - CPU 单图推理目标小于 2 s；
-- 新产线适配阶段允许使用：
-  - 100 张正常样本；
-  - 30 张异常样本；
-- 完成迁移后，在后续 1000+ 测试样本上冻结模型；
+- 新产线适配阶段允许使用 100 张正常样本和 30 张异常样本；
+- 完成适配后，在后续 1000+ 测试样本上冻结模型；
 - 测试数据不加入训练集，不更新模型参数；
 - 用户反馈只在独立更新阶段使用；
-- 反馈模型必须通过历史回放、验证和回滚检查后再发布。
+- 更新后的模型必须经过历史回放、验证和回滚检查后再发布。
 
 ---
 
@@ -59,15 +57,12 @@
 | VisA | 12 类复杂工业对象 | 外观异常、多组件异常和电子元件异常 |
 | MVTec LOCO AD | 5 类结构和逻辑异常 | 缺件、多件、错位、错误组合和逻辑异常 |
 
-数据目录：
+数据目录包括：
 
-```text
-data/
-├── mvtec_ad/
-├── dagm2007/
-├── visa/
-└── mvtec_loco_ad/
-```
+- `data/mvtec_ad`
+- `data/dagm2007`
+- `data/visa`
+- `data/mvtec_loco_ad`
 
 四个数据集共同用于：
 
@@ -81,41 +76,52 @@ data/
 
 ## 4. 系统整体流程
 
-```text
-┌─────────────────────────────────────────────┐
-│ 阶段一：公共工业数据训练                     │
-│                                             │
-│ MVTec AD                                    │
-│ DAGM 2007                                   │
-│ VisA                                        │
-│ MVTec LOCO AD                               │
-│                                             │
-│ 学习通用局部纹理、全局结构和工业异常特征     │
-└───────────────────┬─────────────────────────┘
-                    │
-                    │ industrial_pretrained.pth
-                    ▼
-┌─────────────────────────────────────────────┐
-│ 阶段二：目标产线少样本适配                   │
-│                                             │
-│ 100 张正常样本                               │
-│ 30 张真实异常样本                            │
-│ 纹理 / 颜色 / 几何 / 组件合成异常            │
-│                                             │
-│ 更新轻量任务头、正常性参数和融合参数         │
-└───────────────────┬─────────────────────────┘
-                    │
-                    │ target_model.pth
-                    │ normal_reference.pth
-                    ▼
-┌───────────────────┬─────────────────────────┐
-│                   │                         │
-▼                   ▼                         ▼
-实时图片检测         实时视频检测              用户反馈优化
-F16/F32 多尺度       帧级异常检测              反馈样本缓存
-单次骨干前向         状态机接口                安全重训
-异常图与异常分数     时序模型接口              验证与回滚
-```
+系统分为四个阶段。
+
+### 阶段一：公共工业数据训练
+
+使用 MVTec AD、DAGM 2007、VisA 和 MVTec LOCO AD 进行离线训练，学习通用的工业纹理、局部外观、全局结构和异常判别能力。
+
+训练完成后输出：
+
+- `industrial_pretrained.pth`
+
+### 阶段二：目标产线少样本适配
+
+使用目标产品的：
+
+- 100 张正常样本；
+- 30 张真实异常样本；
+- 纹理、颜色、几何和组件合成异常。
+
+更新目标产品相关的正常性参数、异常分类头、轻量适配参数、融合权重和检测阈值。
+
+适配完成后输出：
+
+- `target_model.pth`
+- `normal_reference.pth`
+
+### 阶段三：冻结检测
+
+完成少样本适配后，在正式测试数据上冻结模型，支持：
+
+- 实时单图检测；
+- 视频逐帧检测；
+- 异常热力图输出；
+- 已见异常和未见异常识别；
+- 颜色、几何和组件异常分析。
+
+### 阶段四：用户反馈优化
+
+用户反馈不会直接用于正式测试阶段在线学习，而是在独立更新流程中完成：
+
+- 反馈样本记录；
+- 困难正常样本和困难异常样本缓存；
+- 阈值平滑调整；
+- 轻量参数周期更新；
+- 历史样本回放；
+- 新旧模型验证；
+- 性能下降时自动回滚。
 
 ---
 
@@ -125,22 +131,16 @@ F16/F32 多尺度       帧级异常检测              反馈样本缓存
 
 当前代码使用：
 
-```text
-ConvNeXtV2-Tiny-384
-```
+- ConvNeXtV2-Tiny-384
 
-输入尺寸：
+输入尺寸为 384×384。
 
-```text
-B × 3 × 384 × 384
-```
+核心多尺度特征包括：
 
-核心多尺度特征：
-
-```text
-F16：B × 384 × 24 × 24
-F32：B × 768 × 12 × 12
-```
+| 特征层 | 特征尺寸 | 主要作用 |
+|---|---|---|
+| F16 | B×384×24×24 | 局部纹理、小缺陷和未见外观异常 |
+| F32 | B×768×12×12 | 全局结构、组件关系和装配异常 |
 
 当前使用 ConvNeXtV2-Tiny 的原因：
 
@@ -154,9 +154,7 @@ F32：B × 768 × 12 × 12
 
 项目中同时保留公开可用的 ConvNeXt-L 预训练权重：
 
-```text
-model/convnext_large_22k_1k_224.pth
-```
+- `model/convnext_large_22k_1k_224.pth`
 
 ConvNeXt-L 后续可用于：
 
@@ -164,9 +162,9 @@ ConvNeXt-L 后续可用于：
 - 教师模型；
 - 特征蒸馏；
 - 与 ConvNeXtV2-Tiny 进行精度对比；
-- 验证更大骨干是否能够提升未见异常泛化。
+- 验证更大骨干是否能提升未见异常泛化。
 
-当前实测结果均来自 ConvNeXtV2-Tiny，不能将 ConvNeXt-L 的精度或延迟作为已验证结果。
+当前实测结果均来自 ConvNeXtV2-Tiny，ConvNeXt-L 尚未完成相同条件下的精度和延迟验证。
 
 ---
 
@@ -175,12 +173,6 @@ ConvNeXt-L 后续可用于：
 F16 和 F32 是当前方案不可删除的两条核心分支。
 
 ### 6.1 F16 局部外观分支
-
-F16 特征尺寸：
-
-```text
-F16 ∈ R^(B × 384 × 24 × 24)
-```
 
 F16 具有较高空间分辨率，主要处理：
 
@@ -193,23 +185,11 @@ F16 具有较高空间分辨率，主要处理：
 - 局部色差；
 - 小面积未见外观异常。
 
-当前局部头：
+F16 分支输出局部异常热力图，并通过高响应区域聚合得到图像级局部异常分数。
 
-```text
-F16
-→ local_head
-→ 24×24 局部异常图
-→ Top-K 聚合
-→ 局部异常分数
-```
+此前实验已经证明，缺少 F16 局部正常性建模时，未见异常检测性能会明显下降，因此 F16 是当前系统中不可替代的局部异常主线。
 
 ### 6.2 F32 全局结构分支
-
-F32 特征尺寸：
-
-```text
-F32 ∈ R^(B × 768 × 12 × 12)
-```
 
 F32 具有更大的感受野，主要处理：
 
@@ -222,127 +202,58 @@ F32 具有更大的感受野，主要处理：
 - 几何形态变化；
 - 逻辑结构异常。
 
-当前 F32 接入：
-
-```text
-F32
-├── global_head
-├── component_head
-├── geometry_head
-├── domain_head
-└── fusion_head
-```
+F32 连接全局异常头、组件状态头、几何头和融合模块，用于补充 F16 无法可靠描述的全局结构信息。
 
 ---
 
 ## 7. 当前模型结构
 
-当前 `aoi_model.py` 的基础结构：
+当前模型以 ConvNeXtV2-Tiny 为共享骨干，并包含以下任务分支：
 
-```text
-输入图像：384×384
-        │
-        ▼
-ConvNeXtV2-Tiny
-        │
-        ├── F16
-        │    └── local_head
-        │         ├── local_map
-        │         ├── local_mean_score
-        │         └── local_top_score
-        │
-        └── F32
-             ├── global_head
-             ├── component_head
-             ├── geometry_head
-             ├── domain_head
-             └── fusion_head
-```
-
-各分支职责：
-
-| 分支 | 作用 |
+| 分支 | 主要作用 |
 |---|---|
-| `local_head` | 局部外观缺陷和异常热力图 |
-| `global_head` | 图像级整体异常分类 |
-| `component_head` | 组件状态和结构异常接口 |
-| `geometry_head` | 几何变化和尺寸异常接口 |
-| `domain_head` | 真实异常与合成异常域对齐 |
-| `fusion_head` | 多分支异常分数融合 |
-| `TemporalLogicHead` | 视频状态序列建模接口 |
+| F16 局部异常头 | 输出局部异常热力图和局部异常分数 |
+| F32 全局异常头 | 判断整体图像是否异常 |
+| 组件状态头 | 为缺件、错位和组件关系异常提供接口 |
+| 几何异常头 | 为尺寸变化、轮廓变化和形态异常提供接口 |
+| 域对齐头 | 缓解真实异常和合成异常之间的分布差异 |
+| 融合头 | 联合局部、全局、组件、几何和颜色证据 |
+| 时序逻辑头 | 为视频状态序列建模提供接口 |
 
 需要注意：
 
-- `component_head` 必须结合组件标签、组件 Mask、组件框或可控组件异常合成进行训练；
-- `geometry_head` 必须定义明确的几何监督目标；
+- 组件状态头必须结合组件标签、组件框、组件 Mask 或可控组件异常合成进行训练；
+- 几何异常头必须定义明确的几何监督目标；
 - 仅定义输出头不能证明模型已经具备完整的缺件或尺寸检测能力。
 
 ---
 
 ## 8. 当前强基线：F16 局部记忆检索
 
-当前已经跑通的强基线使用：
+当前已经跑通的强基线使用 F16 局部 Token 建立目标产品正常参考库。
 
-```text
-F16 局部 Token
-→ 正常 Token 库
-→ GPU 最近邻距离
-→ Top-1% 最大距离均值
-```
+推理时，测试图像的每个 F16 局部 Token 与正常 Token 库进行最近邻距离比较，并取距离最高的一部分区域作为局部异常分数。
 
-正常参考包括：
+正常参考还包括：
 
-| 参考类型 | 特征来源 | 方法 |
+| 参考类型 | 特征来源 | 建模方法 |
 |---|---|---|
-| 局部参考 | F16 局部 Token | GPU 最近邻距离 |
-| 全局参考 | F32 全局池化特征 | Ledoit-Wolf + Mahalanobis |
-| 颜色参考 | LAB 颜色统计 | Ledoit-Wolf + Mahalanobis |
-| 几何参考 | 边缘和轮廓特征 | Ledoit-Wolf + Mahalanobis |
-
-GPU 最近邻距离使用以下等价分解：
-
-```text
-distance²(x, y)
-=
-||x||²
-+
-||y||²
--
-2 × x · y
-```
-
-对应代码：
-
-```python
-for start in range(0, bank.shape[0], chunk_size):
-    bank_chunk = bank[start:start + chunk_size]
-    bank_norm_chunk = bank_sq_norm[start:start + chunk_size]
-
-    distances = (
-        token_sq_norm
-        + bank_norm_chunk.unsqueeze(0)
-        - 2.0 * torch.matmul(tokens, bank_chunk.T)
-    )
-
-    minimum_distance = torch.minimum(
-        minimum_distance,
-        distances.min(dim=1).values,
-    )
-```
+| F16 局部参考 | 局部 Token | GPU 最近邻检索 |
+| F32 全局参考 | 全局池化特征 | 正常均值、协方差和 Mahalanobis 距离 |
+| 颜色参考 | LAB 颜色统计 | 正常分布距离 |
+| 几何参考 | 边缘和轮廓统计 | 正常分布距离 |
 
 该实验已经证明：
 
 > F16 局部正常性建模是未见局部缺陷检测的关键。
 
-但是，局部 Token 记忆库属于非参数检索方法，需要额外保存目标产品的正常局部特征，因此不作为最终模型的核心算法。
+但是，F16 Token 记忆库属于非参数检索方法，需要额外保存目标产品的正常局部特征，因此不作为最终模型的核心算法。
 
 当前版本保留为：
 
-```text
-Memory-bank Baseline
-```
+- Memory-bank Baseline
 
-用于后续与纯参数化模型进行公平对比。
+其主要作用是为后续参数化模型提供强基线和消融对照。
 
 ---
 
@@ -352,474 +263,108 @@ Memory-bank Baseline
 
 模块名称：
 
-```text
-Learnable Normal Basis Residual Module
-LNBR
-可学习正常基残差模块
-```
+- Learnable Normal Basis Residual Module
+- LNBR
+- 可学习正常基残差模块
 
-### 9.1 F16 Token 展开
+### 9.1 可学习正常基
 
-F16 特征图空间尺寸为 24×24，因此每张图片包含：
+LNBR 在模型内部维护固定数量的可训练正常基。
 
-```text
-24 × 24 = 576 个局部 Token
-```
+这些正常基：
 
-展开后的形状：
-
-```text
-Z16 ∈ R^(B × 576 × 384)
-```
-
-其中：
-
-- `B`：批次大小；
-- `576`：局部 Token 数量；
-- `384`：每个 Token 的通道维度。
-
-### 9.2 可学习正常基
-
-模型内部维护可训练正常基：
-
-```text
-B16 ∈ R^(K × 384)
-```
-
-其中 `K` 可以设置为 16、32 或 64。
-
-代码示例：
-
-```python
-self.normal_basis_f16 = nn.Parameter(
-    torch.randn(normal_basis_count, 384)
-)
-```
-
-正常基属于模型参数：
-
+- 是模型参数；
 - 参与反向传播；
 - 保存到 `target_model.pth`；
-- 参数量固定；
+- 参数数量固定；
 - 推理时不读取外部局部特征库；
-- 用户反馈后通过轻量微调更新；
-- 与卷积核和全连接层权重具有相同的参数属性。
+- 用户反馈后可以通过轻量微调更新。
 
-### 9.3 正常基软分配
+它们用于表示目标产品常见的正常局部模式，例如正常纹理、边缘、孔位、接缝和局部结构。
 
-首先对局部 Token 和正常基进行 L2 归一化：
+### 9.2 正常特征重构
 
-```text
-Z16_norm = L2Normalize(Z16)
-B16_norm = L2Normalize(B16)
-```
+F16 局部 Token 根据与正常基的相似度进行软分配，再由正常基重构局部特征。
 
-计算局部 Token 和每个正常基之间的相似度：
+正常区域通常能够被正常基较好地解释，因此重构残差较低。
 
-```text
-similarity
-=
-Z16_norm × transpose(B16_norm)
-```
+异常区域与正常模式不一致，重构残差通常较高。
 
-加入温度参数：
+局部残差可以恢复为 24×24 的异常图，用于定位：
 
-```text
-scaled_similarity
-=
-similarity / temperature
-```
+- 划痕；
+- 裂纹；
+- 污点；
+- 崩边；
+- 未见局部异常。
 
-通过 Softmax 获得软分配矩阵：
+### 9.3 正常区域压缩
 
-```text
-A
-=
-Softmax(scaled_similarity)
-```
+大量低残差正常 Token 不再全部进入后续全局建模，而是根据正常基聚合为固定数量的正常聚合 Token。
 
-分配矩阵形状：
+该过程可以：
 
-```text
-A ∈ R^(B × 576 × K)
-```
+- 压缩重复正常区域；
+- 降低高分辨率特征的全局建模开销；
+- 保留不同类型的正常局部模式；
+- 避免所有正常位置被等权处理。
 
-含义：
+### 9.4 高残差 Token 保留
 
-- `A[b, i, k]` 表示第 `b` 张图片的第 `i` 个局部 Token 对第 `k` 个正常基的分配权重；
-- 每个 Token 对所有正常基的权重和为 1；
-- 温度越小，分配越接近硬聚类；
-- 温度越大，分配越平滑。
+残差最高的少量 Token 被保留为独立疑似异常 Token。
 
-### 9.4 正常特征重构
+例如，原始 F16 包含 576 个局部 Token，可以压缩为：
 
-使用正常基对局部特征进行重构：
+- 32 个正常聚合 Token；
+- 16 个高残差疑似异常 Token。
 
-```text
-Z16_hat
-=
-A × B16
-```
+该设计借鉴 C²SSM 的簇中心思想，但不照搬完整恢复网络，重点实现：
 
-其中：
+- 大面积正常区域压缩；
+- 高残差异常位置保留；
+- 小缺陷不被全局平均；
+- 固定长度的轻量后续建模。
 
-```text
-Z16_hat ∈ R^(B × 576 × 384)
-```
+### 9.5 LNBR 训练目标
 
-每个局部 Token 的重构残差：
+LNBR 的训练目标包括：
 
-```text
-R16[i]
-=
-L2Distance(
-    Z16[i],
-    Z16_hat[i]
-)
-```
+- 降低正常样本的局部重构残差；
+- 提高异常样本高风险区域的残差；
+- 防止多个正常基退化为相同模式；
+- 防止所有 Token 只使用少数正常基；
+- 使用异常 Mask 对局部残差图进行监督；
+- 使用真实异常和合成异常共同训练异常边界。
 
-也可以写为：
-
-```text
-R16[i]
-=
-sqrt(
-    sum(
-        (Z16[i] - Z16_hat[i])²
-    )
-)
-```
-
-正常区域应具有较低残差，异常区域应具有较高残差。
-
-### 9.5 局部异常图
-
-将 576 个局部残差恢复为 24×24 空间形式：
-
-```text
-M16 ∈ R^(B × 1 × 24 × 24)
-```
-
-图像级局部异常分数采用最高残差区域的平均值：
-
-```text
-s16
-=
-Mean(
-    TopK(R16)
-)
-```
-
-其中 Top-K 比例由配置项控制：
-
-```text
-local_top_ratio
-```
-
-该分数主要反映图像中最异常的少量局部区域。
-
-### 9.6 正常区域压缩
-
-低残差正常 Token 按正常基进行加权聚合。
-
-第 `k` 个正常聚合 Token：
-
-```text
-C[k]
-=
-sum_i(
-    A[i, k] × Z16[i]
-)
-/
-(
-    sum_i(
-        A[i, k]
-    )
-    +
-    epsilon
-)
-```
-
-最终得到：
-
-```text
-C ∈ R^(B × K × 384)
-```
-
-含义：
-
-- 原始 F16 有 576 个局部 Token；
-- 大量重复正常区域按正常基聚合；
-- 最终压缩为固定数量的 `K` 个正常聚合 Token；
-- 不再对所有正常位置进行高开销全局建模。
-
-### 9.7 高残差 Token 保留
-
-根据局部残差选择 Top-M 个疑似异常 Token：
-
-```text
-abnormal_indices
-=
-TopMIndices(R16)
-```
-
-保留对应原始特征：
-
-```text
-Z_abnormal
-=
-Gather(
-    Z16,
-    abnormal_indices
-)
-```
-
-形状：
-
-```text
-Z_abnormal ∈ R^(B × M × 384)
-```
-
-例如：
-
-```text
-576 个原始 F16 Token
-→ 32 个正常聚合 Token
-+ 16 个高残差 Token
-```
-
-该设计借鉴 C²SSM 的簇中心思想，用于：
-
-- 压缩大面积重复正常区域；
-- 降低后续全局建模开销；
-- 防止小缺陷被全局平均池化；
-- 保留疑似异常位置的细粒度特征。
-
-### 9.8 LNBR 训练损失
-
-#### 正常重构损失
-
-正常图片的局部 Token 应能被正常基解释：
-
-```text
-L_normal
-=
-Mean(R16_normal)
-```
-
-目标：
-
-```text
-正常样本残差尽可能低
-```
-
-#### 正常基多样性损失
-
-防止多个正常基退化为相同向量：
-
-```text
-basis_similarity
-=
-B16_norm × transpose(B16_norm)
-```
-
-```text
-L_div
-=
-MeanSquaredError(
-    basis_similarity,
-    IdentityMatrix
-)
-```
-
-目标：
-
-```text
-不同正常基学习不同的正常局部模式
-```
-
-#### 分配均衡损失
-
-防止所有局部 Token 都分配到同一个正常基：
-
-```text
-mean_assignment
-=
-Mean(A, dimensions=[batch, token])
-```
-
-```text
-target_assignment
-=
-1 / K
-```
-
-```text
-L_balance
-=
-MeanSquaredError(
-    mean_assignment,
-    target_assignment
-)
-```
-
-#### 异常间隔损失
-
-对于异常图片：
-
-```text
-L_abnormal
-=
-max(
-    0,
-    abnormal_margin - s16_abnormal
-)
-```
-
-对于正常图片：
-
-```text
-L_normal_margin
-=
-max(
-    0,
-    s16_normal - normal_margin
-)
-```
-
-联合间隔损失：
-
-```text
-L_margin
-=
-L_abnormal
-+
-L_normal_margin
-```
-
-目标：
-
-```text
-正常样本局部残差低
-异常样本局部残差高
-```
-
-#### 异常 Mask 监督
-
-当合成异常或公开数据集提供异常 Mask 时：
-
-```text
-L_map
-=
-BCE(residual_map, anomaly_mask)
-+
-DiceLoss(residual_map, anomaly_mask)
-```
-
-该损失用于让高残差区域与真实缺陷区域对齐。
+最终目标是让正常局部区域能够被参数化正常基稳定解释，而未见异常区域产生明显残差。
 
 ---
 
 ## 10. F16/F32 跨尺度建模
 
-最终模型不只分别输出 F16 和 F32 分数，还会进一步联合：
+最终模型不只分别输出 F16 和 F32 分数，还会联合：
 
-```text
-F16 正常聚合 Token
-+
-F16 高残差 Token
-+
-F32 全局 Token
-        │
-        ▼
-轻量跨尺度关系模块
-        │
-        ▼
-局部外观、全局结构和组件关系表示
-```
+- F16 正常聚合 Token；
+- F16 高残差疑似异常 Token；
+- F32 全局结构 Token。
 
-输入 Token 数量固定：
-
-```text
-K 个正常聚合 Token
-+
-M 个高残差 Token
-+
-F32 Token
-```
-
-跨尺度模块可以采用：
-
-- 轻量 Attention；
-- MLP Mixer；
-- 1～2 层 Token Mixer；
-- 低秩关系建模；
-- 轻量状态空间模块。
-
-该模块的主要目标：
+这些 Token 输入轻量跨尺度关系模块，用于：
 
 - 将 F16 局部异常证据传递到 F32 全局结构表示；
-- 保留小面积高残差区域；
-- 建模局部缺陷和全局装配结构之间的关系；
-- 控制高分辨率特征建模开销。
+- 建模局部缺陷与整体装配结构之间的关系；
+- 防止小缺陷被全局特征平均；
+- 控制高分辨率全局建模开销；
+- 提升组件缺失、局部错位和装配异常检测能力。
+
+跨尺度模块可以采用轻量 Attention、Token Mixer、低秩关系建模或轻量状态空间结构。
 
 ---
 
-## 11. F32 参数化全局正常性
+## 11. F32 全局正常性建模
 
-当前强基线使用外部 F32 均值和协方差计算 Mahalanobis 距离。
+当前强基线使用 F32 正常均值和协方差计算全局异常距离。
 
-最终模型计划增加参数化全局正常性头。
-
-F32 全局池化：
-
-```text
-g32
-=
-GlobalAveragePooling(F32)
-```
-
-通过映射层降维：
-
-```text
-h32
-=
-Linear(g32)
-```
-
-模型内部维护：
-
-```text
-global_normal_mean
-global_normal_log_variance
-```
-
-形状：
-
-```text
-global_normal_mean ∈ R^d
-global_normal_log_variance ∈ R^d
-```
-
-全局正常能量：
-
-```text
-variance
-=
-exp(global_normal_log_variance)
-+
-epsilon
-```
-
-```text
-global_energy
-=
-sum(
-    (h32 - global_normal_mean)² / variance
-    +
-    global_normal_log_variance
-)
-```
+最终模型计划增加参数化全局正常性头，将目标产品的全局正常中心和正常变化范围表示为模型参数。
 
 该分支主要处理：
 
@@ -830,51 +375,31 @@ sum(
 - 组件组合异常；
 - 整体颜色和分布变化。
 
-最终 F32 正常性参数保存到 `target_model.pth`，不依赖高维外部特征库。
+F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外部全局特征库。
 
 ---
 
 ## 12. 多分支融合
 
-最终融合输入：
+最终融合模块联合以下异常证据：
 
-```text
-fusion_features = [
-    f16_residual_score,
-    f32_global_energy,
-    supervised_classification_score,
-    component_anomaly_score,
-    geometry_anomaly_score,
-    color_anomaly_score,
-]
-```
+- F16 局部残差分数；
+- F32 全局正常性分数；
+- 监督异常分类分数；
+- 组件异常分数；
+- 几何异常分数；
+- 颜色异常分数。
 
-融合器示例：
+不同分支首先进行尺度标准化，再由轻量融合头输出最终异常分数。
 
-```python
-self.fusion_head = nn.Sequential(
-    nn.LayerNorm(6),
-    nn.Linear(6, 16),
-    nn.GELU(),
-    nn.Dropout(0.1),
-    nn.Linear(16, 1),
-)
-```
+融合头主要通过：
 
-最终异常分数：
+- 100 张目标正常样本；
+- 30 张目标异常样本；
 
-```text
-final_score
-=
-fusion_head(fusion_features)
-```
+进行新产线快速校准。
 
-融合头主要由：
-
-- 100 张正常样本；
-- 30 张异常样本；
-
-进行目标产线校准。
+相比固定手工权重，学习式融合可以根据不同产品的缺陷特点自动调整局部、全局、颜色、几何和组件分支的重要性。
 
 ---
 
@@ -882,62 +407,45 @@ fusion_head(fusion_features)
 
 ### 13.1 当前已实现训练
 
-当前 `pretrain-public` 在四个公开工业数据集上进行联合训练，主要使用：
+当前 `pretrain-public` 已经支持在四个公开工业数据集上进行联合训练，主要包含：
 
-- BCE 图像级分类损失；
-- 全局异常损失；
-- F16 局部 Top-K 损失；
-- BCE + Dice 分割损失；
-- 组件辅助损失；
-- 几何辅助损失；
-- Ranking Loss；
-- WeightedRandomSampler。
+- 图像级正常/异常分类；
+- F16 局部异常监督；
+- F32 全局异常监督；
+- 像素级异常区域监督；
+- 正常与异常排名约束；
+- 真实异常与合成异常域对齐；
+- 类别不平衡采样。
 
-### 13.2 计划增加的开放集 Episode
+### 13.2 开放集少样本 Episode
 
-后续增加：
+后续计划增加：
 
-```text
-0-shot
-1-shot
-2-shot
-5-shot
-30-shot
-```
-
-开放集 episode。
+- 0-shot；
+- 1-shot；
+- 2-shot；
+- 5-shot；
+- 30-shot。
 
 每个 episode 包含：
 
-```text
-support_normal
-support_anomaly
-query_normal
-query_seen_anomaly
-query_unseen_anomaly
-```
+- 支持集正常样本；
+- 支持集异常样本；
+- 查询集正常样本；
+- 查询集已见异常；
+- 查询集未见异常。
 
-该训练用于模拟新产线的少样本启动过程。
+该训练用于模拟新产线在不同异常样本数量下的启动过程。
 
-本项目不采用额外的 MAML 或 Reptile 模型，也不生成独立的：
+本项目不采用额外的 MAML 或 Reptile 模型，也不生成独立的 `meta_model.pth`。
 
-```text
-meta_model.pth
-```
+计划训练流程为：
 
-计划训练流程：
+1. 普通公共工业预训练；
+2. 开放集少样本 episode 训练；
+3. 目标产线 100/30 适配。
 
-```text
-阶段 A：普通公共工业预训练
-阶段 B：开放集少样本 Episode 训练
-阶段 C：目标产线 100/30 适配
-```
-
-最终仍然输出：
-
-```text
-industrial_pretrained.pth
-```
+最终仍然输出统一的工业预训练模型。
 
 ---
 
@@ -948,7 +456,7 @@ industrial_pretrained.pth
 100 张正常样本用于：
 
 - 适配 F16 正常基；
-- 适配 F16 局部 Adapter；
+- 适配局部轻量参数；
 - 降低正常样本的 F16 重构残差；
 - 适配 F32 全局正常性参数；
 - 建立颜色统计；
@@ -967,20 +475,18 @@ industrial_pretrained.pth
 - 训练 F32 全局异常边界；
 - 训练跨尺度融合头；
 - 训练轻量 Adapter；
-- 校准已见异常和正常样本之间的决策边界。
+- 校准正常和异常之间的决策边界。
 
-### 14.3 当前渐进式解冻
+### 14.3 渐进式解冻
 
-当前适配过程：
+当前目标适配采用渐进式训练：
 
-```text
-Step 1：任务头训练
-Step 2：解冻 Stage 4
-Step 3：解冻 Stage 3 后部
-Step 4：仅使用真实样本进行收尾校准
-```
+1. 先训练任务头；
+2. 再解冻 Stage 4；
+3. 再解冻 Stage 3 后部；
+4. 最后仅使用真实样本进行收尾校准。
 
-每个阶段均使用验证集 AUC 保存最佳模型，降低少样本过拟合风险。
+每个阶段均使用验证集 AUC 保存最佳模型，以降低少样本过拟合风险。
 
 ---
 
@@ -988,25 +494,21 @@ Step 4：仅使用真实样本进行收尾校准
 
 `synthetic_engine.py` 用于生成四类异质异常：
 
-| 类型 | 示例 | 主要监督分支 |
+| 类型 | 示例 | 主要作用 |
 |---|---|---|
-| 纹理异常 | 划痕、裂纹、污点、孔洞 | F16 局部残差 |
-| 颜色异常 | 色偏、褪色、亮度变化 | F16、颜色分支 |
-| 几何异常 | 缩放、形变、错位、旋转 | F16、F32、geometry head |
-| 语义或组件异常 | 缺件、替换、多件、错误组合 | F32、component head |
+| 纹理异常 | 划痕、裂纹、污点、孔洞 | 强化 F16 局部外观异常检测 |
+| 颜色异常 | 色偏、褪色、亮度变化 | 强化局部颜色和整体颜色异常检测 |
+| 几何异常 | 缩放、形变、错位、旋转 | 强化 F16/F32 和几何分支 |
+| 语义或组件异常 | 缺件、替换、多件、错误组合 | 强化 F32 和组件分支 |
 
-统一输出结构：
+合成数据需要统一返回：
 
-```python
-{
-    "image": synthetic_image,
-    "mask": anomaly_mask,
-    "anomaly_type": anomaly_type,
-    "task_type": task_type,
-}
-```
+- 合成异常图；
+- 异常区域 Mask；
+- 异常类型；
+- 对应任务类型。
 
-GAN 的定位：
+GAN 的定位是：
 
 > 扩大 30 张真实异常无法覆盖的缺陷空间，而不是替代真实异常样本。
 
@@ -1020,64 +522,29 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ### 16.1 当前 Memory-bank Baseline
 
-```text
-输入图像
-    │
-    ▼
-ConvNeXtV2-Tiny 单次前向
-    │
-    ├── F16 局部异常图
-    ├── F32 全局异常分数
-    ├── 组件和几何输出
-    └── F16/F32 特征复用
-             │
-             ▼
-GPU 局部正常 Token 检索
-+
-F32 全局统计
-+
-颜色统计
-+
-几何统计
-             │
-             ▼
-多分支融合
-             │
-             ▼
-最终异常分数
-```
+当前基线流程为：
+
+1. 输入图像经过 ConvNeXtV2-Tiny 单次前向；
+2. F16 输出局部异常图；
+3. F32 输出全局异常分数；
+4. 复用 F16/F32 特征进行正常参考评分；
+5. 计算局部、全局、颜色和几何异常分数；
+6. 进行多分支融合；
+7. 根据校准阈值输出异常判断。
 
 当前 ROI 精修分支默认关闭，因为现有实验没有显示有效收益。
 
 ### 16.2 最终 LNBR 模型
 
-```text
-输入图像
-    │
-    ▼
-ConvNeXtV2-Tiny 单次前向
-    │
-    ├── F16
-    │    └── LNBR
-    │         ├── 局部残差图
-    │         ├── 正常聚合 Token
-    │         └── 高残差 Token
-    │
-    └── F32
-         ├── 全局异常分类
-         ├── 全局正常能量
-         ├── 组件状态
-         └── 几何状态
-                │
-                ▼
-         跨尺度关系模块
-                │
-                ▼
-             融合头
-                │
-                ▼
-      最终异常分数 + 异常位置
-```
+最终模型流程为：
+
+1. 输入图像经过 ConvNeXt 单次前向；
+2. F16 进入 LNBR；
+3. 输出局部残差图、正常聚合 Token 和高残差 Token；
+4. F32 输出全局异常、组件和几何状态；
+5. F16/F32 Token 进入跨尺度关系模块；
+6. 多分支融合头输出最终异常分数；
+7. 同时输出局部异常位置。
 
 最终版推理不再访问外部 F16 局部 Token 库。
 
@@ -1085,67 +552,51 @@ ConvNeXtV2-Tiny 单次前向
 
 ## 17. 阈值校准
 
-系统使用正常校准集确定异常阈值。
+系统使用独立正常校准集确定最终异常阈值。
 
-有限样本 conformal 分位点：
-
-```python
-rank = math.ceil(
-    (sample_count + 1)
-    * (1.0 - target_normal_fpr)
-) - 1
-
-rank = min(
-    max(rank, 0),
-    sample_count - 1,
-)
-
-threshold = sorted_scores[rank]
-```
+当前采用有限样本 conformal 分位点进行正常阈值估计。
 
 需要注意：
 
 - `target_normal_fpr=0.05` 是目标值；
 - 该配置不代表测试集实际 FPR 一定等于 5%；
 - 正常校准样本较少时，阈值估计存在较大方差；
-- 必须在独立目标产品测试集上报告实际 FPR。
+- 必须在独立目标产品测试集上报告实际正常误报率。
 
 ---
 
 ## 18. 视频检测
 
-视频检测分为两层。
+视频检测分为两个阶段。
 
 ### 18.1 当前可实现能力
 
 当前支持：
 
-- 按帧检测；
-- 帧级异常分数统计；
+- 视频逐帧读取；
+- 帧级异常检测；
 - 连续异常帧过滤；
-- 组件状态变化记录；
-- 基于人工规则的状态机检测；
-- 视频推理命令接口。
+- 帧级组件状态记录；
+- 视频异常分数汇总；
+- 基于人工规则的状态机接口。
 
 ### 18.2 后续时序训练
 
-具有真实产线视频序列后，可训练：
+具有真实产线视频序列后，可进一步训练：
 
 - GRU；
 - TCN；
 - 轻量时序 Transformer；
 - 显式状态转移模型。
 
-需要的视频标签：
+需要的视频标签包括：
 
-```text
-正常工序序列
-缺步序列
-错序序列
-重复步骤序列
-异常持续时间
-组件状态变化
-```
+- 正常工序序列；
+- 缺步序列；
+- 错序序列；
+- 重复步骤序列；
+- 异常持续时间；
+- 组件状态变化。
 
 在没有真实时序监督数据前，GRU 仅作为模型接口，不能宣称已经完成可靠的缺步、错序和重复步骤识别。
 
@@ -1155,59 +606,38 @@ threshold = sorted_scores[rank]
 
 用户反馈分为：
 
-```text
-误报：正常产品被判为异常
-漏报：异常产品被判为正常
-```
+- 误报：正常产品被判为异常；
+- 漏报：异常产品被判为正常。
 
 ### 19.1 阈值调整方向
 
 异常分数越高表示越异常，因此：
 
-```text
-误报增加
-→ 阈值应适当提高
+- 误报增加时，阈值应适当提高；
+- 漏报增加时，阈值应适当降低。
 
-漏报增加
-→ 阈值应适当降低
-```
-
-阈值采用平滑更新：
-
-```text
-new_threshold
-=
-(1 - update_rate) × old_threshold
-+
-update_rate × candidate_threshold
-```
-
-同时限制单次相对变化幅度。
+阈值采用平滑更新，并限制单次变化幅度，避免少量反馈导致决策边界剧烈变化。
 
 ### 19.2 反馈样本池
 
 反馈样本分别进入：
 
-```text
-hard_normal_buffer
-hard_anomaly_buffer
-```
+- 困难正常样本池；
+- 困难异常样本池。
 
 单条反馈不直接更新模型参数或正常基，避免模型污染。
 
 ### 19.3 周期安全更新
 
-反馈积累到一定数量后：
+反馈积累到一定数量后执行：
 
-```text
-备份当前模型
-→ 合并原始 100/30 数据与反馈数据
-→ 更新 Adapter、LNBR、异常头和融合头
-→ 在历史验证集进行回放
-→ 检查 AUROC、F1、FPR 和异常召回率
-→ 通过后发布
-→ 失败则自动回滚
-```
+1. 备份当前模型；
+2. 合并原始 100/30 数据和反馈数据；
+3. 更新 Adapter、LNBR、异常头和融合头；
+4. 在历史验证集上回放；
+5. 检查 AUROC、F1、正常误报率和异常召回率；
+6. 验证通过后发布；
+7. 性能下降时自动回滚。
 
 安全检查至少包括：
 
@@ -1224,24 +654,19 @@ hard_anomaly_buffer
 
 当前实验设置：
 
-```text
-目标数据集：MVTec AD
-目标类别：grid
-完全未见异常类型：bent
-Query 样本数：48
-```
+| 项目 | 设置 |
+|---|---|
+| 目标数据集 | MVTec AD |
+| 目标类别 | grid |
+| 完全未见异常类型 | bent |
+| Query 样本数 | 48 |
 
 当前最强结果来自：
 
-```text
-ConvNeXtV2-Tiny
-+
-F16 GPU 局部 Token 记忆检索
-+
-F32 全局统计
-+
-颜色和几何统计
-```
+- ConvNeXtV2-Tiny；
+- F16 GPU 局部 Token 记忆检索；
+- F32 全局统计；
+- 颜色和几何统计。
 
 实验结果：
 
@@ -1274,7 +699,7 @@ F32 全局统计
 
 > F16 局部正常性建模对未见缺陷检测起关键作用。
 
-但当前高精度依赖非参数 Memory-bank，因此下一阶段需要使用 LNBR 替代，并与该强基线进行公平对比。
+但当前高精度依赖非参数 Memory-bank，因此下一阶段需要使用 LNBR 替代，并与当前强基线进行公平对比。
 
 当前延迟仅在现有服务器和 384×384 输入上验证，尚未完成：
 
@@ -1288,58 +713,37 @@ F32 全局统计
 
 ## 21. 项目目录
 
-```text
-AOI/
-├── main.py
-├── aoi_model.py
-├── convnextv2.py
-├── config.py
-├── config.json
-├── example_config.json
-├── requirements.txt
-│
-├── modules/
-│   ├── realtime_detection.py
-│   ├── fewshot_transfer.py
-│   ├── normal_reference.py
-│   ├── synthetic_engine.py
-│   └── feedback_optimization.py
-│
-├── utils/
-│   ├── image.py
-│   ├── paths.py
-│   └── manifests.py
-│
-├── model/
-│   ├── convnextv2_tiny_22k_384_ema.pt
-│   └── convnext_large_22k_1k_224.pth
-│
-├── data/
-│   ├── mvtec_ad/
-│   ├── dagm2007/
-│   ├── visa/
-│   └── mvtec_loco_ad/
-│
-└── aoi_full_workspace/
-    ├── splits/
-    ├── checkpoints/
-    ├── deployment/
-    ├── feedback/
-    └── backups/
-```
-
-文件职责：
-
-| 文件 | 职责 |
+| 路径 | 作用 |
 |---|---|
-| `aoi_model.py` | F16/F32 多尺度模型、任务头、LNBR 和时序接口 |
-| `fewshot_transfer.py` | 公共工业训练和 100/30 目标适配 |
-| `normal_reference.py` | 颜色、几何、分数校准和阈值 |
-| `synthetic_engine.py` | 四类异质异常合成 |
-| `realtime_detection.py` | 单图、视频和批量评估 |
-| `feedback_optimization.py` | 反馈样本管理、安全更新和回滚 |
-| `utils/paths.py` | 四个公开数据集扫描和目标划分 |
-| `utils/image.py` | 图像读取、预处理和低维统计提取 |
+| `main.py` | 命令行统一入口 |
+| `aoi_model.py` | F16/F32 多尺度模型、任务头和时序接口 |
+| `convnextv2.py` | ConvNeXtV2 骨干实现 |
+| `config.py` | 配置读取和路径管理 |
+| `config.json` | 默认训练与部署配置 |
+| `modules/realtime_detection.py` | 单图、视频和批量评估 |
+| `modules/fewshot_transfer.py` | 公共训练和目标产线少样本适配 |
+| `modules/normal_reference.py` | 正常统计、分数校准和阈值 |
+| `modules/synthetic_engine.py` | 四类异质异常合成 |
+| `modules/feedback_optimization.py` | 反馈管理、安全更新和回滚 |
+| `utils/image.py` | 图像读取、预处理和低维特征 |
+| `utils/paths.py` | 数据集扫描和目标划分 |
+| `utils/manifests.py` | 数据清单管理 |
+| `model` | 预训练权重目录 |
+| `data` | 四个公开工业数据集目录 |
+| `aoi_full_workspace` | 划分、模型、部署结果和反馈数据 |
+
+主要模型文件：
+
+- `model/convnextv2_tiny_22k_384_ema.pt`
+- `model/convnext_large_22k_1k_224.pth`
+
+工作空间主要包括：
+
+- `aoi_full_workspace/splits`
+- `aoi_full_workspace/checkpoints`
+- `aoi_full_workspace/deployment`
+- `aoi_full_workspace/feedback`
+- `aoi_full_workspace/backups`
 
 ---
 
@@ -1347,22 +751,18 @@ AOI/
 
 当前 `main.py` 包含 8 个命令：
 
-```text
-make-split
-pretrain-public
-adapt
-evaluate
-infer-image
-infer-video
-feedback
-feedback-retrain
-```
+| 命令 | 作用 |
+|---|---|
+| `make-split` | 构建公开训练集、100/30 支持集和 seen/unseen 查询集 |
+| `pretrain-public` | 在四个公开工业数据集上进行离线训练 |
+| `adapt` | 使用目标产品 100 正常和 30 异常进行迁移 |
+| `evaluate` | 评估正常、已见异常和未见异常 |
+| `infer-image` | 单张图片推理 |
+| `infer-video` | 视频逐帧推理 |
+| `feedback` | 记录误报或漏报反馈 |
+| `feedback-retrain` | 使用反馈样本进行安全重训 |
 
-查看帮助：
-
-```bash
-python main.py --help
-```
+可以通过 `python main.py --help` 查看完整参数。
 
 ---
 
@@ -1370,153 +770,96 @@ python main.py --help
 
 ### 23.1 构建目标划分
 
-```bash
-python main.py --config config.json make-split \
-    --target-dataset mvtec_ad \
-    --target-category grid \
-    --unseen-type bent \
-    --normal-budget 100 \
-    --anomaly-budget 30
-```
+使用 `make-split` 指定：
 
-输出：
+- 目标数据集；
+- 目标类别；
+- 完全未见异常类型；
+- 正常样本预算；
+- 异常样本预算。
 
-```text
-aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/
-├── public_train.jsonl
-├── public_val.jsonl
-├── support/
-│   ├── normal/
-│   └── anomaly/
-└── query/
-    ├── normal/
-    ├── seen/
-    └── unseen/
-```
+当前测试划分为：
+
+- 目标数据集：MVTec AD；
+- 目标类别：grid；
+- 未见异常类型：bent；
+- 正常样本预算：100；
+- 异常样本预算：30。
+
+划分结果保存在：
+
+- `aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent`
 
 ### 23.2 公共工业训练
 
-冒烟测试：
+使用 `pretrain-public` 读取划分目录中的公共训练清单，完成四个公开数据集联合训练。
 
-```bash
-python main.py --config config.json pretrain-public \
-    --split-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent \
-    --epochs 1 \
-    --steps-per-epoch 30
-```
+输出模型：
 
-正式训练示例：
-
-```bash
-python main.py --config config.json pretrain-public \
-    --split-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent \
-    --epochs 5 \
-    --steps-per-epoch 300
-```
-
-输出：
-
-```text
-aoi_full_workspace/checkpoints/industrial_pretrained.pth
-```
+- `aoi_full_workspace/checkpoints/industrial_pretrained.pth`
 
 ### 23.3 目标产线适配
 
-仅使用真实异常：
+使用 `adapt` 指定：
 
-```bash
-python main.py --config config.json adapt \
-    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/normal \
-    --anomaly-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/anomaly \
-    --disable-synthetic
-```
-
-启用合成异常：
-
-```bash
-python main.py --config config.json adapt \
-    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/normal \
-    --anomaly-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/anomaly
-```
+- 100 张正常样本目录；
+- 30 张异常样本目录；
+- 是否启用合成异常。
 
 输出：
 
-```text
-aoi_full_workspace/deployment/
-├── target_model.pth
-└── normal_reference.pth
-```
+- `aoi_full_workspace/deployment/target_model.pth`
+- `aoi_full_workspace/deployment/normal_reference.pth`
 
 ### 23.4 批量评估
 
-```bash
-python main.py --config config.json evaluate \
-    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal \
-    --seen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/seen \
-    --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen
-```
+使用 `evaluate` 指定：
 
-### 23.5 单图推理
+- 正常查询集；
+- 已见异常查询集；
+- 未见异常查询集。
 
-```bash
-python main.py --config config.json infer-image \
-    --image data/test_image.jpg
-```
+输出包括：
 
-### 23.6 视频推理
+- Overall AUROC；
+- Seen AUROC；
+- Unseen AUROC；
+- Accuracy；
+- Precision；
+- Recall；
+- F1；
+- Normal FPR；
+- TP、FP、TN、FN；
+- 平均延迟；
+- P95 延迟。
 
-```bash
-python main.py --config config.json infer-video \
-    --video data/production_video.mp4 \
-    --frame-stride 5
-```
+### 23.5 图片和视频推理
 
-### 23.7 记录用户反馈
+使用：
 
-误报示例：
+- `infer-image` 完成单张图片推理；
+- `infer-video` 完成视频逐帧推理。
 
-```bash
-python main.py --config config.json feedback \
-    --image data/false_positive.jpg \
-    --predicted-label 1 \
-    --corrected-label 0 \
-    --score 2.35 \
-    --note "正常产品因表面反光被误判"
-```
+### 23.6 用户反馈
 
-漏报示例：
+使用：
 
-```bash
-python main.py --config config.json feedback \
-    --image data/false_negative.jpg \
-    --predicted-label 0 \
-    --corrected-label 1 \
-    --score 1.20 \
-    --note "小面积崩边未被检测"
-```
-
-### 23.8 反馈安全重训
-
-```bash
-python main.py --config config.json feedback-retrain \
-    --normal-dir data/target/normal \
-    --anomaly-dir data/target/anomaly \
-    --validation-normal-dir data/validation/normal
-```
+- `feedback` 记录误报和漏报；
+- `feedback-retrain` 执行反馈样本安全重训。
 
 ---
 
 ## 24. 关键配置
 
-当前基础配置：
+### 24.1 基础配置
 
 | 配置项 | 作用 |
 |---|---|
-| `student_checkpoint` | 当前 ConvNeXtV2-Tiny 初始权重路径 |
-| `global_size` | 全图输入尺寸 |
+| `student_checkpoint` | 当前 ConvNeXtV2-Tiny 初始权重 |
+| `global_size` | 模型全图输入尺寸 |
 | `component_slots` | 组件状态输出数量 |
 | `geometry_dims` | 几何输出维度 |
-| `local_top_ratio` | 局部异常 Top-K 比例 |
+| `local_top_ratio` | 局部异常高响应区域比例 |
 | `head_epochs` | 任务头训练轮数 |
 | `stage4_epochs` | Stage 4 解冻训练轮数 |
 | `stage3_epochs` | Stage 3 解冻训练轮数 |
@@ -1524,16 +867,16 @@ python main.py --config config.json feedback-retrain \
 | `feedback_retrain_min_samples` | 触发反馈重训的最少样本数 |
 | `enable_roi_refinement` | 是否启用 ROI 精修 |
 
-Memory-bank baseline 配置：
+### 24.2 Memory-bank Baseline 配置
 
 | 配置项 | 作用 |
 |---|---|
 | `enable_memory_local` | 是否启用 F16 局部 Token 检索 |
 | `memory_local_weight` | 局部记忆分数权重 |
 | `memory_global_weight` | F32 全局统计分数权重 |
-| `local_bank_chunk_size` | GPU 最近邻分块大小 |
+| `local_bank_chunk_size` | GPU 最近邻检索分块大小 |
 
-LNBR 计划配置：
+### 24.3 LNBR 计划配置
 
 | 配置项 | 建议值 | 作用 |
 |---|---:|---|
@@ -1541,15 +884,15 @@ LNBR 计划配置：
 | `abnormal_token_count` | 16 | 保留的高残差 Token 数量 |
 | `normal_basis_temperature` | 0.1 | 正常基软分配温度 |
 | `normal_loss_weight` | 1.0 | 正常残差损失权重 |
-| `basis_diversity_weight` | 0.05 | 正常基多样性损失权重 |
-| `basis_balance_weight` | 0.05 | 分配均衡损失权重 |
-| `residual_margin_weight` | 1.0 | 异常间隔损失权重 |
+| `basis_diversity_weight` | 0.05 | 正常基多样性约束权重 |
+| `basis_balance_weight` | 0.05 | 正常基使用均衡约束权重 |
+| `residual_margin_weight` | 1.0 | 异常残差间隔损失权重 |
 
 ---
 
 ## 25. 当前开发状态
 
-### 已完成
+### 25.1 已完成
 
 - 四个公开工业数据集扫描；
 - 目标类别排除式公共训练划分；
@@ -1567,7 +910,7 @@ LNBR 计划配置：
 - 批量评估；
 - 反馈记录和备份框架。
 
-### 正在重构
+### 25.2 正在重构
 
 - 使用 LNBR 替代最终版 F16 局部 Token 记忆库；
 - F16 正常 Token 压缩；
@@ -1576,7 +919,7 @@ LNBR 计划配置：
 - 参数化 F32 全局正常性头；
 - 学习式多分支融合。
 
-### 待完成
+### 25.3 待完成
 
 - 0/1/2/5/30-shot 开放集 episode 训练；
 - 组件头真实监督；
@@ -1606,17 +949,15 @@ LNBR 完成后，首先在相同 `grid/bent` 划分上与当前 Memory-bank base
 | Mean Latency | 101.7 ms | 待测试 |
 | P95 Latency | 113.3 ms | 待测试 |
 | 外部局部特征库 | 需要 | 不需要 |
-| 参数量 | 固定模型 + Token 库 | 固定模型参数 |
-| 反馈更新 | 更新特征库 | 更新轻量参数 |
+| 参数量 | 模型参数加 Token 库 | 固定模型参数 |
+| 反馈更新 | 更新特征库 | 更新轻量模型参数 |
 
 随后扩展到：
 
-```text
-MVTec AD / grid
-MVTec AD / screw
-VisA / pcb 或 capsules
-MVTec LOCO AD / breakfast_box
-```
+- MVTec AD / grid；
+- MVTec AD / screw；
+- VisA / PCB 或 capsules；
+- MVTec LOCO AD / breakfast_box。
 
 分别验证：
 
@@ -1634,37 +975,22 @@ MVTec LOCO AD / breakfast_box
 
 最终目标不是单一异常分类器，也不是单纯的最近邻记忆检索系统，而是：
 
-```text
-ConvNeXt 多尺度工业视觉骨干
-+
-F16 可学习正常基残差
-+
-正常区域 Token 压缩
-+
-高残差异常 Token 保留
-+
-F32 全局结构与装配建模
-+
-四类异质异常增强
-+
-100/30 少样本快速适配
-+
-视频状态检测
-+
-用户反馈安全更新
-```
+- ConvNeXt 多尺度工业视觉骨干；
+- F16 可学习正常基残差；
+- 正常区域 Token 压缩；
+- 高残差疑似异常 Token 保留；
+- F32 全局结构与装配建模；
+- 四类异质异常增强；
+- 100/30 少样本快速适配；
+- 视频状态检测；
+- 用户反馈安全更新。
 
-核心结构：
+核心主线为：
 
-```text
-F16 局部正常性建模
-+
-F32 全局结构建模
-+
-开放集少样本迁移
-+
-用户反馈闭环
-```
+> F16 局部正常性建模  
+> + F32 全局结构建模  
+> + 开放集少样本迁移  
+> + 用户反馈闭环
 
 ---
 
