@@ -1,0 +1,980 @@
+from __future__ import annotations
+
+from contextlib import nullcontext
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Iterable
+
+import cv2
+import numpy as np
+from PIL import Image, ImageEnhance
+import torch
+import torch.nn.functional as F
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
+    WeightedRandomSampler,
+)
+from sklearn.metrics import roc_auc_score
+
+from config import AOIConfig
+from aoi_model import AOIMultiBranchModel
+from modules.normal_reference import NormalReference
+from modules.synthetic_engine import SyntheticEngine
+from utils.image import (
+    geometry_statistics,
+    load_rgb,
+    normalize_image,
+)
+
+from modules.realtime_detection import (
+    AOIRealtimeDetector,
+)
+
+
+class PublicIndustrialDataset(Dataset):
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        config: AOIConfig,
+        training: bool,
+    ):
+        self.records = records
+        self.config = config
+        self.training = training
+
+        if not records:
+            raise ValueError("Public industrial dataset is empty.")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    @staticmethod
+    def _load_mask(
+        path: str,
+        size: int,
+    ) -> tuple[torch.Tensor, float]:
+        if not path or not Path(path).exists():
+            return (
+                torch.zeros(1, size, size, dtype=torch.float32),
+                0.0,
+            )
+
+        with Image.open(path) as image:
+            image = image.convert("L").resize(
+                (size, size),
+                Image.NEAREST,
+            )
+            array = np.asarray(image, dtype=np.float32) / 255.0
+            array = (array > 0.5).astype(np.float32)
+
+        return torch.from_numpy(array)[None], 1.0
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        record = self.records[index]
+        image = load_rgb(record["path"])
+        horizontal_flip = False
+
+        if self.training:
+            horizontal_flip = np.random.random() < 0.5
+            if horizontal_flip:
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+
+            image = ImageEnhance.Brightness(image).enhance(
+                float(np.random.uniform(0.9, 1.1))
+            )
+            image = ImageEnhance.Contrast(image).enhance(
+                float(np.random.uniform(0.9, 1.1))
+            )
+
+        geometry = geometry_statistics(image)
+        image_tensor = normalize_image(
+            image,
+            self.config.train_size,
+        )
+        mask, has_mask = self._load_mask(
+            str(record.get("mask_path", "")),
+            self.config.train_size,
+        )
+        if horizontal_flip:
+            mask = torch.flip(mask, dims=[2])
+
+        return {
+            "image": image_tensor,
+            "mask": mask,
+            "has_mask": torch.tensor(has_mask, dtype=torch.float32),
+            "label": torch.tensor(
+                float(record["label"]),
+                dtype=torch.float32,
+            ),
+            "geometry": torch.from_numpy(geometry),
+            "task_type": str(record.get("task_type", "appearance")),
+        }
+
+
+class TargetDataset(Dataset):
+    def __init__(
+        self,
+        normal_paths: list[str],
+        anomaly_paths: list[str],
+        config: AOIConfig,
+        training: bool = True,
+        synthetic_engine: SyntheticEngine | None = None,
+        synthetic_probability: float = 0.0,
+    ):
+        self.config = config
+        self.training = training
+        self.synthetic_engine = synthetic_engine
+        self.synthetic_probability = synthetic_probability
+        self.items = [
+            (path, 0) for path in normal_paths
+        ] + [
+            (path, 1) for path in anomaly_paths
+        ]
+
+        if not self.items:
+            raise ValueError("Target dataset is empty.")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        path, label = self.items[index]
+        image = load_rgb(path)
+        is_synthetic = 0
+
+        if (
+            self.training
+            and label == 0
+            and self.synthetic_engine is not None
+            and np.random.random() < self.synthetic_probability
+        ):
+            generator = np.random.choice(
+                ["appearance", "color", "geometry"]
+            )
+            if generator == "appearance":
+                image, _ = self.synthetic_engine.appearance(image)
+            elif generator == "color":
+                image = self.synthetic_engine.color(image)
+            else:
+                image = self.synthetic_engine.geometry(image)
+            label = 1
+            is_synthetic = 1
+
+        return {
+            "image": normalize_image(
+                image,
+                self.config.train_size,
+            ),
+            "label": torch.tensor(float(label)),
+            "domain": torch.tensor(float(is_synthetic)),
+            "path": path,
+        }
+
+
+def _local_image_logit(
+    local_logits: torch.Tensor,
+    top_ratio: float,
+) -> torch.Tensor:
+    flat = local_logits.flatten(1)
+    k = max(1, int(round(flat.shape[1] * top_ratio)))
+    return torch.topk(flat, k=k, dim=1).values.mean(dim=1)
+
+
+def _dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    probability = torch.sigmoid(logits)
+    intersection = (probability * target).sum(dim=(-2, -1))
+    denominator = (
+        probability.sum(dim=(-2, -1))
+        + target.sum(dim=(-2, -1))
+    )
+    return (
+        1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+    ).mean()
+
+
+def _ranking_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    positive = scores[labels > 0.5]
+    negative = scores[labels <= 0.5]
+    if len(positive) == 0 or len(negative) == 0:
+        return scores.new_tensor(0.0)
+    difference = positive[:, None] - negative[None, :]
+    return F.relu(1.0 - difference).mean()
+
+
+class FewShotTransfer:
+    """
+    Problem 2: few-shot/zero-shot startup and generalization.
+
+    The same module handles two stages:
+    1. public industrial training on MVTec AD, VisA, DAGM and LOCO;
+    2. target transfer using 100 normal and 30 anomalous images.
+    """
+
+    def __init__(
+        self,
+        config: AOIConfig,
+        model: AOIMultiBranchModel,
+    ):
+        self.config = config
+        self.model = model.to(config.device)
+        self.reference = NormalReference(config)
+
+    def _autocast(self):
+        if self.config.device.startswith("cuda") and self.config.amp:
+            return torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+            )
+        return nullcontext()
+
+    def build_zero_shot_reference(
+        self,
+        normal_paths: Iterable[str | Path],
+        output_path: str | Path | None = None,
+    ) -> NormalReference:
+        normal_paths = [str(path) for path in normal_paths]
+        self.reference.fit(self.model, normal_paths)
+        if output_path is not None:
+            self.reference.save(output_path)
+        return self.reference
+
+    # ------------------------------------------------------------------
+    # Public industrial training
+    # ------------------------------------------------------------------
+    def _set_public_trainable(self) -> None:
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+
+        for module in [
+            self.model.local_head,
+            self.model.global_head,
+            self.model.component_head,
+            self.model.geometry_head,
+            self.model.domain_head,
+            self.model.fusion_head,
+        ]:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+        for stage_index in [2, 3]:
+            for parameter in self.model.backbone.stages[
+                stage_index
+            ].parameters():
+                parameter.requires_grad = True
+            for parameter in self.model.backbone.downsample_layers[
+                stage_index
+            ].parameters():
+                parameter.requires_grad = True
+
+    def _public_optimizer(self) -> torch.optim.Optimizer:
+        heads = []
+        backbone = []
+
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith("backbone."):
+                backbone.append(parameter)
+            else:
+                heads.append(parameter)
+
+        return torch.optim.AdamW(
+            [
+                {
+                    "params": heads,
+                    "lr": self.config.public_lr_head,
+                },
+                {
+                    "params": backbone,
+                    "lr": self.config.public_lr_backbone,
+                },
+            ],
+            weight_decay=self.config.public_weight_decay,
+        )
+
+    def _public_loss(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        images = batch["image"].to(self.config.device)
+        labels = batch["label"].to(self.config.device)
+        masks = batch["mask"].to(self.config.device)
+        has_mask = batch["has_mask"].to(self.config.device)
+        geometry_target = batch["geometry"].to(self.config.device)
+        task_types = batch["task_type"]
+
+        output = self.model(images)
+
+        classification = F.binary_cross_entropy_with_logits(
+            output["final_logit"],
+            labels,
+        )
+        global_loss = F.binary_cross_entropy_with_logits(
+            output["global_logit"],
+            labels,
+        )
+        local_score = _local_image_logit(
+            output["local_logits"],
+            self.config.local_top_ratio,
+        )
+        local_loss = F.binary_cross_entropy_with_logits(
+            local_score,
+            labels,
+        )
+
+        selected = has_mask > 0.5
+        if selected.any():
+            target_mask = F.interpolate(
+                masks[selected],
+                size=output["local_logits"].shape[-2:],
+                mode="nearest",
+            )
+            segmentation = (
+                F.binary_cross_entropy_with_logits(
+                    output["local_logits"][selected],
+                    target_mask,
+                )
+                + _dice_loss(
+                    output["local_logits"][selected],
+                    target_mask,
+                )
+            )
+        else:
+            segmentation = classification.new_tensor(0.0)
+
+        structure_mask = torch.tensor(
+            [
+                task in {"structure", "logic"}
+                for task in task_types
+            ],
+            dtype=torch.bool,
+            device=self.config.device,
+        )
+        if structure_mask.any():
+            component_score = output["component_logits"][
+                structure_mask
+            ].mean(dim=1)
+            component_loss = F.binary_cross_entropy_with_logits(
+                component_score,
+                labels[structure_mask],
+            )
+        else:
+            component_loss = classification.new_tensor(0.0)
+
+        geometry_loss = F.smooth_l1_loss(
+            output["geometry"],
+            geometry_target,
+        )
+        ranking = _ranking_loss(
+            output["final_logit"],
+            labels,
+        )
+
+        loss = (
+            classification
+            + self.config.public_global_weight * global_loss
+            + self.config.public_local_weight * local_loss
+            + self.config.public_segmentation_weight * segmentation
+            + self.config.public_component_weight * component_loss
+            + self.config.public_geometry_weight * geometry_loss
+            + self.config.public_rank_weight * ranking
+        )
+
+        parts = {
+            "classification": float(classification.detach().cpu()),
+            "global": float(global_loss.detach().cpu()),
+            "local": float(local_loss.detach().cpu()),
+            "segmentation": float(segmentation.detach().cpu()),
+            "component": float(component_loss.detach().cpu()),
+            "geometry": float(geometry_loss.detach().cpu()),
+            "ranking": float(ranking.detach().cpu()),
+        }
+        return loss, parts
+
+    @torch.inference_mode()
+    def _validate_public(
+        self,
+        loader: DataLoader,
+    ) -> dict[str, float]:
+        self.model.eval()
+        labels: list[int] = []
+        scores: list[float] = []
+        losses: list[float] = []
+
+        for batch in loader:
+            images = batch["image"].to(self.config.device)
+            batch_labels = batch["label"].to(self.config.device)
+            output = self.model(images)
+            loss = F.binary_cross_entropy_with_logits(
+                output["final_logit"],
+                batch_labels,
+            )
+            labels.extend(
+                batch_labels.int().cpu().numpy().tolist()
+            )
+            scores.extend(
+                output["final_logit"].float().cpu().numpy().tolist()
+            )
+            losses.append(float(loss.cpu()))
+
+        labels_array = np.asarray(labels, dtype=int)
+        scores_array = np.asarray(scores, dtype=float)
+        auroc = (
+            float(roc_auc_score(labels_array, scores_array))
+            if len(np.unique(labels_array)) > 1
+            else float("nan")
+        )
+        return {
+            "loss": float(np.mean(losses)) if losses else float("nan"),
+            "auroc": auroc,
+        }
+
+    def pretrain_public(
+        self,
+        train_records: list[dict[str, Any]],
+        validation_records: list[dict[str, Any]],
+        output_path: str | Path,
+        epochs: int | None = None,
+        steps_per_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        train_dataset = PublicIndustrialDataset(
+            train_records,
+            self.config,
+            training=True,
+        )
+        validation_dataset = PublicIndustrialDataset(
+            validation_records,
+            self.config,
+            training=False,
+        )
+
+        label_counts: dict[int, int] = {0: 0, 1: 0}
+        for record in train_records:
+            label_counts[int(record["label"])] += 1
+        sample_weights = [
+            1.0 / max(1, label_counts[int(record["label"])])
+            for record in train_records
+        ]
+
+        batch_size = min(
+            self.config.public_batch_size,
+            len(train_dataset),
+        )
+        steps = steps_per_epoch or self.config.public_steps_per_epoch
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=steps * batch_size,
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=self.config.public_num_workers,
+            pin_memory=self.config.device.startswith("cuda"),
+            drop_last=True,
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=self.config.public_num_workers,
+            pin_memory=self.config.device.startswith("cuda"),
+        )
+
+        self._set_public_trainable()
+        optimizer = self._public_optimizer()
+        scaler = torch.cuda.amp.GradScaler(
+            enabled=(
+                self.config.device.startswith("cuda")
+                and self.config.amp
+            )
+        )
+
+        epoch_count = epochs or self.config.public_epochs
+        best_auc = -np.inf
+        best_state = deepcopy(self.model.state_dict())
+        history: list[dict[str, float]] = []
+
+        for epoch in range(1, epoch_count + 1):
+            self.model.train()
+            epoch_losses: list[float] = []
+
+            for batch in train_loader:
+                optimizer.zero_grad(set_to_none=True)
+                with self._autocast():
+                    loss, _ = self._public_loss(batch)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [
+                        parameter
+                        for parameter in self.model.parameters()
+                        if parameter.requires_grad
+                    ],
+                    max_norm=1.0,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                epoch_losses.append(float(loss.detach().cpu()))
+
+            validation = self._validate_public(validation_loader)
+            train_loss = float(np.mean(epoch_losses))
+            record = {
+                "epoch": float(epoch),
+                "train_loss": train_loss,
+                "val_loss": validation["loss"],
+                "val_auroc": validation["auroc"],
+            }
+            history.append(record)
+
+            print(
+                f"[public] epoch={epoch:03d} "
+                f"train_loss={train_loss:.5f} "
+                f"val_loss={validation['loss']:.5f} "
+                f"val_auc={validation['auroc']:.5f}"
+            )
+
+            if (
+                np.isfinite(validation["auroc"])
+                and validation["auroc"] > best_auc
+            ):
+                best_auc = validation["auroc"]
+                best_state = deepcopy(self.model.state_dict())
+
+        self.model.load_state_dict(best_state)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "best_validation_auroc": (
+                    float(best_auc) if np.isfinite(best_auc) else None
+                ),
+                "history": history,
+            },
+            output_path,
+        )
+        output_path.with_suffix(".history.json").write_text(
+            __import__("json").dumps(
+                history,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print("[public] saved:", output_path)
+        return {
+            "checkpoint": str(output_path),
+            "best_validation_auroc": (
+                float(best_auc) if np.isfinite(best_auc) else None
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Target few-shot transfer
+    # ------------------------------------------------------------------
+    def _set_trainable(self, stage: str) -> None:
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+
+        for module in [
+            self.model.local_head,
+            self.model.global_head,
+            self.model.component_head,
+            self.model.geometry_head,
+            self.model.domain_head,
+            self.model.fusion_head,
+        ]:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+        if stage in {"stage4", "stage3"}:
+            for parameter in self.model.backbone.stages[3].parameters():
+                parameter.requires_grad = True
+
+        if stage == "stage3":
+            for block in self.model.backbone.stages[2][-2:]:
+                for parameter in block.parameters():
+                    parameter.requires_grad = True
+
+    def _optimizer(self) -> torch.optim.Optimizer:
+        groups = {"head": [], "stage4": [], "stage3": []}
+
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith("backbone.stages.3"):
+                groups["stage4"].append(parameter)
+            elif name.startswith("backbone.stages.2"):
+                groups["stage3"].append(parameter)
+            else:
+                groups["head"].append(parameter)
+
+        parameter_groups = []
+        for key, learning_rate in [
+            ("head", self.config.lr_head),
+            ("stage4", self.config.lr_stage4),
+            ("stage3", self.config.lr_stage3),
+        ]:
+            if groups[key]:
+                parameter_groups.append({
+                    "params": groups[key],
+                    "lr": learning_rate,
+                })
+
+        return torch.optim.AdamW(
+            parameter_groups,
+            weight_decay=self.config.weight_decay,
+        )
+
+    @torch.inference_mode()
+    def _target_auc(
+        self,
+        normal_paths: list[str],
+        anomaly_paths: list[str],
+    ) -> float:
+        if not normal_paths or not anomaly_paths:
+            return float("nan")
+
+        self.model.eval()
+        labels: list[int] = []
+        scores: list[float] = []
+        for path, label in [
+            *[(path, 0) for path in normal_paths],
+            *[(path, 1) for path in anomaly_paths],
+        ]:
+            image = load_rgb(path)
+            tensor = normalize_image(
+                image,
+                self.config.train_size,
+            )[None].to(self.config.device)
+            output = self.model(tensor)
+            labels.append(label)
+            scores.append(
+                float(output["final_logit"][0].float().cpu())
+            )
+        return float(roc_auc_score(labels, scores))
+
+    def _train_phase(
+        self,
+        normal_paths: list[str],
+        anomaly_paths: list[str],
+        validation_normal: list[str],
+        validation_anomaly: list[str],
+        stage: str,
+        epochs: int,
+        synthetic_engine: SyntheticEngine | None = None,
+        synthetic_probability: float = 0.0,
+    ) -> None:
+        self._set_trainable(stage)
+        optimizer = self._optimizer()
+
+        dataset = TargetDataset(
+            normal_paths=normal_paths,
+            anomaly_paths=anomaly_paths,
+            config=self.config,
+            training=True,
+            synthetic_engine=synthetic_engine,
+            synthetic_probability=synthetic_probability,
+        )
+
+        counts = {
+            0: max(1, len(normal_paths)),
+            1: max(1, len(anomaly_paths)),
+        }
+        weights = [
+            1.0 / counts[label]
+            for _, label in dataset.items
+        ]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(weights, dtype=torch.double),
+            num_samples=max(len(dataset), self.config.batch_size * 8),
+            replacement=True,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=min(self.config.batch_size, len(dataset)),
+            sampler=sampler,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.device.startswith("cuda"),
+        )
+
+        scaler = torch.cuda.amp.GradScaler(
+            enabled=(
+                self.config.device.startswith("cuda")
+                and self.config.amp
+            )
+        )
+        best_auc = -np.inf
+        best_state = deepcopy(self.model.state_dict())
+
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            losses: list[float] = []
+
+            for batch in loader:
+                images = batch["image"].to(self.config.device)
+                labels = batch["label"].to(self.config.device)
+                domains = batch["domain"].to(self.config.device)
+                coefficient = 1.0 if synthetic_probability > 0 else 0.0
+
+                optimizer.zero_grad(set_to_none=True)
+                with self._autocast():
+                    output = self.model(
+                        images,
+                        domain_coefficient=coefficient,
+                    )
+                    local_score = _local_image_logit(
+                        output["local_logits"],
+                        self.config.local_top_ratio,
+                    )
+                    classification = F.binary_cross_entropy_with_logits(
+                        output["final_logit"],
+                        labels,
+                    )
+                    global_loss = F.binary_cross_entropy_with_logits(
+                        output["global_logit"],
+                        labels,
+                    )
+                    local_loss = F.binary_cross_entropy_with_logits(
+                        local_score,
+                        labels,
+                    )
+                    domain_loss = (
+                        F.binary_cross_entropy_with_logits(
+                            output["domain_logit"],
+                            domains,
+                        )
+                        if synthetic_probability > 0
+                        else classification.new_tensor(0.0)
+                    )
+                    loss = (
+                        classification
+                        + 0.25 * global_loss
+                        + 0.25 * local_loss
+                        + 0.05 * domain_loss
+                    )
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [
+                        parameter
+                        for parameter in self.model.parameters()
+                        if parameter.requires_grad
+                    ],
+                    max_norm=1.0,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                losses.append(float(loss.detach().cpu()))
+
+            validation_auc = self._target_auc(
+                validation_normal,
+                validation_anomaly,
+            )
+            print(
+                f"[transfer] stage={stage} epoch={epoch:03d} "
+                f"loss={np.mean(losses):.5f} "
+                f"val_auc={validation_auc:.5f}"
+            )
+            if (
+                np.isfinite(validation_auc)
+                and validation_auc > best_auc
+            ):
+                best_auc = validation_auc
+                best_state = deepcopy(self.model.state_dict())
+
+        self.model.load_state_dict(best_state)
+
+    @torch.inference_mode()
+    def _combined_scores(
+        self,
+        paths: list[str],
+    ) -> np.ndarray:
+        """
+        阈值校准必须使用与最终部署完全相同的评分流程。
+
+        不能再单独实现一套：
+        supervised + normal reference。
+        """
+        self.model.eval()
+
+        detector = AOIRealtimeDetector(
+            config=self.config,
+            model=self.model,
+            reference=self.reference,
+        )
+
+        scores: list[float] = []
+
+        for path in paths:
+            result = detector.inspect_image(
+                path
+            )
+            scores.append(
+                float(result["score"])
+            )
+
+        return np.asarray(
+            scores,
+            dtype=np.float32,
+        )
+
+    def adapt(
+        self,
+        normal_paths: list[str],
+        anomaly_paths: list[str],
+        output_model_path: str | Path,
+        output_reference_path: str | Path,
+        synthetic_engine: SyntheticEngine | None = None,
+    ) -> None:
+        if len(normal_paths) < 20:
+            raise ValueError(
+                "At least 20 normal target images are required."
+            )
+        if len(anomaly_paths) < 2:
+            raise ValueError(
+                "At least 2 anomalous target images are required."
+            )
+
+        rng = np.random.default_rng(42)
+        normal_array = np.asarray(normal_paths, dtype=object)
+        anomaly_array = np.asarray(anomaly_paths, dtype=object)
+        rng.shuffle(normal_array)
+        rng.shuffle(anomaly_array)
+
+        normal_val_count = max(5, round(len(normal_array) * 0.2))
+        normal_val_count = min(normal_val_count, len(normal_array) - 5)
+        anomaly_val_count = max(1, round(len(anomaly_array) * 0.2))
+        anomaly_val_count = min(anomaly_val_count, len(anomaly_array) - 1)
+
+        validation_normal = normal_array[:normal_val_count].tolist()
+        train_normal = normal_array[normal_val_count:].tolist()
+        validation_anomaly = anomaly_array[:anomaly_val_count].tolist()
+        train_anomaly = anomaly_array[anomaly_val_count:].tolist()
+
+        self._train_phase(
+            train_normal,
+            train_anomaly,
+            validation_normal,
+            validation_anomaly,
+            stage="heads",
+            epochs=self.config.head_epochs,
+        )
+        self._train_phase(
+            train_normal,
+            train_anomaly,
+            validation_normal,
+            validation_anomaly,
+            stage="stage4",
+            epochs=self.config.stage4_epochs,
+        )
+        self._train_phase(
+            train_normal,
+            train_anomaly,
+            validation_normal,
+            validation_anomaly,
+            stage="stage3",
+            epochs=self.config.stage3_epochs,
+            synthetic_engine=synthetic_engine,
+            synthetic_probability=(
+                0.35 if synthetic_engine is not None else 0.0
+            ),
+        )
+        self._train_phase(
+            train_normal,
+            train_anomaly,
+            validation_normal,
+            validation_anomaly,
+            stage="heads",
+            epochs=self.config.real_correction_epochs,
+        )
+
+        # The normal reference must be extracted from the final adapted model.
+        self.reference.fit(self.model, train_normal)
+        calibration_scores = self._combined_scores(validation_normal)
+        calibration_scores = np.asarray(
+            calibration_scores,
+            dtype=np.float64,
+        )
+
+        calibration_scores = np.sort(
+            calibration_scores
+        )
+
+        sample_count = len(calibration_scores)
+
+        if sample_count == 0:
+            raise RuntimeError(
+                "阈值校准集为空，无法确定异常阈值。"
+            )
+
+        target_fpr = float(
+            self.config.target_normal_fpr
+        )
+
+        if not 0.0 < target_fpr < 1.0:
+            raise ValueError(
+                "target_normal_fpr必须位于(0, 1)内。"
+            )
+
+        # 有限样本conformal分位点：
+        # ceil((n + 1) * (1 - alpha))
+        rank = int(
+            np.ceil(
+                (sample_count + 1)
+                * (1.0 - target_fpr)
+            )
+        ) - 1
+
+        rank = min(
+            max(rank, 0),
+            sample_count - 1,
+        )
+
+        self.reference.threshold = float(
+            calibration_scores[rank]
+        )
+
+        print(
+            "[transfer] calibration:",
+            {
+                "count": sample_count,
+                "min": float(
+                    calibration_scores[0]
+                ),
+                "median": float(
+                    np.median(calibration_scores)
+                ),
+                "max": float(
+                    calibration_scores[-1]
+                ),
+                "rank": rank,
+                "target_fpr": target_fpr,
+                "threshold": (
+                    self.reference.threshold
+                ),
+            },
+        )
+
+        output_model_path = Path(output_model_path)
+        output_reference_path = Path(output_reference_path)
+        output_model_path.parent.mkdir(parents=True, exist_ok=True)
+        output_reference_path.parent.mkdir(parents=True, exist_ok=True)
+
+        torch.save(self.model.state_dict(), output_model_path)
+        self.reference.save(output_reference_path)
+
+        print("[transfer] model:", output_model_path)
+        print("[transfer] reference:", output_reference_path)
+        print("[transfer] threshold:", self.reference.threshold)

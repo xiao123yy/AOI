@@ -1,0 +1,12 @@
+{
+  "root": ".",
+  "student_checkpoint": "model/convnextv2_tiny_22k_384_ema.pt",
+  "teacher_checkpoint": "model/convnext_large_22k_1k_224.pth",
+  "workspace": "aoi_full_workspace",
+  "device": "cuda",
+  "global_size": 512,
+  "roi_size": 384,
+  "topk_rois": 2,
+  "component_slots": 8,
+  "threshold_quantile": 0.95
+}
