@@ -46,7 +46,102 @@
 
 ---
 
-## 3. 使用的数据集
+## 3. 项目目录
+
+```
+AOI/
+│
+├── main.py                              # 命令行统一入口（8 个命令）
+├── aoi_model.py                         # 多尺度模型、6 个任务头 + 时序头
+├── convnextv2.py                        # ConvNeXtV2-Tiny 骨干实现
+├── config.py                            # 配置读取、路径解析和验证
+├── config.json                          # 默认训练与部署配置
+├── example_config.json                  # 部署用精简配置示例
+├── requirements.txt                     # Python 依赖
+├── __init__.py
+├── Question.png                         # 题目描述图
+│
+├── vis_infer.py                         # 推理可视化脚本（生成热力图对比）
+│
+├── modules/
+│   ├── __init__.py
+│   ├── realtime_detection.py            # 实时检测引擎（单图/视频/批量评估）
+│   ├── fewshot_transfer.py              # 公共工业预训练 + 目标产线少样本适配
+│   ├── normal_reference.py              # 正常参考库（聚类/马氏距离/GPU最近邻）
+│   ├── synthetic_engine.py              # 异质异常合成（外观/颜色/几何/缺件）
+│   └── feedback_optimization.py         # 用户反馈（即时调阈/周期重训/自动回滚）
+│
+├── utils/
+│   ├── __init__.py
+│   ├── image.py                         # 图像加载、归一化、LAB/几何特征提取
+│   ├── paths.py                         # 数据集扫描、seen/unseen 划分、JSONL 管理
+│   └── manifests.py                     # CSV/JSONL 数据清单读取
+│
+├── model/                               # 预训练权重目录
+│   ├── convnextv2_tiny_22k_384_ema.pt   # ConvNeXtV2-Tiny (ImageNet-22K, 110 MB)
+│   ├── convnext_large_22k_1k_224.pth    # ConvNeXt-Large (22K→1K, 755 MB)
+│   └── model.txt
+│
+├── data/                                # 工业数据集
+│   ├── mvtec_ad/                        # MVTec AD（bottle/cable/.../grid/.../zipper 共15类）
+│   │   ├── bottle/
+│   │   ├── cable/
+│   │   ├── capsule/
+│   │   ├── grid/                        # 当前实验目标类别
+│   │   │   ├── train/good/              #  正常训练图
+│   │   │   └── test/                    #  测试：good/bent/broken/glue/...
+│   │   └── ...
+│   └── dagm2007/                        # DAGM 2007（10 类纹理缺陷）
+│       ├── Class1/
+│       ├── Class2/
+│       └── ...
+│
+├── DFMGAN/                              # StyleGAN2 代码（预留，未集成）
+│   ├── train.py
+│   ├── generate.py
+│   ├── training/
+│   └── ...
+│
+└── aoi_full_workspace/                  # 运行产出（自动生成，可删除重建）
+    ├── checkpoints/
+    │   ├── industrial_pretrained.pth    # 公共预训练权重
+    │   └── industrial_pretrained.history.json  # 训练历史
+    │
+    ├── splits/
+    │   └── mvtec_ad_grid_unseen_bent/   # 实验划分（grid 为目标，bent 为未见）
+    │       ├── public_train.jsonl       # MVTec+DAGM 公共训练清单
+    │       ├── public_val.jsonl         # 公共验证清单
+    │       ├── summary.json             # 划分统计
+    │       ├── support/
+    │       │   ├── normal/              # ~100 张正常图
+    │       │   └── anomaly/             # ~30 张异常图（broken/glue/metal/thread）
+    │       ├── query/
+    │       │   ├── normal/              # ~21 张测试正常图
+    │       │   ├── seen/                # ~15 张已见过缺陷图
+    │       │   └── unseen/              # ~12 张未见缺陷图（bent）
+    │       ├── query_normal.jsonl
+    │       ├── query_seen.jsonl
+    │       └── query_unseen.jsonl
+    │
+    ├── deployment/                      # 最终部署产物
+    │   ├── target_model.pth             # 迁移后的完整模型权重
+    │   └── normal_reference.pth         # 正常参考库（阈值 + 特征库）
+    │
+    ├── evaluation/                      # 批量评估结果
+    │   ├── metrics.json                 # 汇总指标（AUROC/F1/延迟等）
+    │   ├── predictions.csv              # 每张图的预测详情
+    │   └── failed_cases.csv             # 预测错误的样本
+    │
+    ├── feedback/                        # 用户反馈（运行时生成）
+    │   ├── feedback.jsonl               # 反馈日志
+    │   └── rollback/                    # 重训前的模型备份
+    │
+    └── logs/                            # 训练日志
+```
+
+---
+
+## 4. 使用的数据集
 
 离线工业训练使用以下四个公开数据集：
 
@@ -74,7 +169,7 @@
 
 ---
 
-## 4. 系统整体流程
+## 5. 系统整体流程
 
 系统分为四个阶段。
 
@@ -125,7 +220,7 @@
 
 ---
 
-## 5. 骨干网络
+## 6. 骨干网络
 
 ### 5.1 当前可运行模型
 
@@ -168,7 +263,7 @@ ConvNeXt-L 后续可用于：
 
 ---
 
-## 6. F16/F32 多尺度主线
+## 7. F16/F32 多尺度主线
 
 F16 和 F32 是当前方案不可删除的两条核心分支。
 
@@ -206,7 +301,7 @@ F32 连接全局异常头、组件状态头、几何头和融合模块，用于�
 
 ---
 
-## 7. 当前模型结构
+## 8. 当前模型结构
 
 当前模型以 ConvNeXtV2-Tiny 为共享骨干，并包含以下任务分支：
 
@@ -228,7 +323,7 @@ F32 连接全局异常头、组件状态头、几何头和融合模块，用于�
 
 ---
 
-## 8. 当前强基线：F16 局部记忆检索
+## 9. 当前强基线：F16 局部记忆检索
 
 当前已经跑通的强基线使用 F16 局部 Token 建立目标产品正常参考库。
 
@@ -257,7 +352,7 @@ F32 连接全局异常头、组件状态头、几何头和融合模块，用于�
 
 ---
 
-## 9. 最终局部模型：LNBR
+## 10. 最终局部模型：LNBR
 
 最终计划使用模型内部的可学习正常性参数，替代外部 F16 Token 记忆库。
 
@@ -340,7 +435,7 @@ LNBR 的训练目标包括：
 
 ---
 
-## 10. F16/F32 跨尺度建模
+## 11. F16/F32 跨尺度建模
 
 最终模型不只分别输出 F16 和 F32 分数，还会联合：
 
@@ -360,7 +455,7 @@ LNBR 的训练目标包括：
 
 ---
 
-## 11. F32 全局正常性建模
+## 12. F32 全局正常性建模
 
 当前强基线使用 F32 正常均值和协方差计算全局异常距离。
 
@@ -379,7 +474,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 
 ---
 
-## 12. 多分支融合
+## 13. 多分支融合
 
 最终融合模块联合以下异常证据：
 
@@ -403,7 +498,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 
 ---
 
-## 13. 公共工业训练
+## 14. 公共工业训练
 
 ### 13.1 当前已实现训练
 
@@ -449,7 +544,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 
 ---
 
-## 14. 目标产线 100/30 少样本适配
+## 15. 目标产线 100/30 少样本适配
 
 ### 14.1 100 张正常样本
 
@@ -490,7 +585,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 
 ---
 
-## 15. 异质异常增强与 GAN
+## 16. 异质异常增强与 GAN
 
 `synthetic_engine.py` 用于生成四类异质异常：
 
@@ -518,7 +613,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 16. 实时单图检测
+## 17. 实时单图检测
 
 ### 16.1 当前 Memory-bank Baseline
 
@@ -550,7 +645,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 17. 阈值校准
+## 18. 阈值校准
 
 系统使用独立正常校准集确定最终异常阈值。
 
@@ -565,7 +660,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 18. 视频检测
+## 19. 视频检测
 
 视频检测分为两个阶段。
 
@@ -602,7 +697,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 19. 用户反馈驱动优化
+## 20. 用户反馈驱动优化
 
 用户反馈分为：
 
@@ -650,7 +745,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 20. 当前真实实验结果
+## 21. 当前真实实验结果
 
 当前实验设置：
 
@@ -711,62 +806,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 21. 项目目录
-
-| 路径 | 作用 |
-|---|---|
-| `main.py` | 命令行统一入口 |
-| `aoi_model.py` | F16/F32 多尺度模型、任务头和时序接口 |
-| `convnextv2.py` | ConvNeXtV2 骨干实现 |
-| `config.py` | 配置读取和路径管理 |
-| `config.json` | 默认训练与部署配置 |
-| `modules/realtime_detection.py` | 单图、视频和批量评估 |
-| `modules/fewshot_transfer.py` | 公共训练和目标产线少样本适配 |
-| `modules/normal_reference.py` | 正常统计、分数校准和阈值 |
-| `modules/synthetic_engine.py` | 四类异质异常合成 |
-| `modules/feedback_optimization.py` | 反馈管理、安全更新和回滚 |
-| `utils/image.py` | 图像读取、预处理和低维特征 |
-| `utils/paths.py` | 数据集扫描和目标划分 |
-| `utils/manifests.py` | 数据清单管理 |
-| `model` | 预训练权重目录 |
-| `data` | 四个公开工业数据集目录 |
-| `aoi_full_workspace` | 划分、模型、部署结果和反馈数据 |
-
-主要模型文件：
-
-- `model/convnextv2_tiny_22k_384_ema.pt`
-- `model/convnext_large_22k_1k_224.pth`
-
-工作空间主要包括：
-
-- `aoi_full_workspace/splits`
-- `aoi_full_workspace/checkpoints`
-- `aoi_full_workspace/deployment`
-- `aoi_full_workspace/feedback`
-- `aoi_full_workspace/backups`
-
----
-
-## 22. 命令行入口
-
-当前 `main.py` 包含 8 个命令：
-
-| 命令 | 作用 |
-|---|---|
-| `make-split` | 构建公开训练集、100/30 支持集和 seen/unseen 查询集 |
-| `pretrain-public` | 在四个公开工业数据集上进行离线训练 |
-| `adapt` | 使用目标产品 100 正常和 30 异常进行迁移 |
-| `evaluate` | 评估正常、已见异常和未见异常 |
-| `infer-image` | 单张图片推理 |
-| `infer-video` | 视频逐帧推理 |
-| `feedback` | 记录误报或漏报反馈 |
-| `feedback-retrain` | 使用反馈样本进行安全重训 |
-
-可以通过 `python main.py --help` 查看完整参数。
-
----
-
-## 23. 使用流程
+## 22. 使用流程
 
 ### 23.1 构建目标划分
 
@@ -849,7 +889,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 24. 关键配置
+## 23. 关键配置
 
 ### 24.1 基础配置
 
@@ -890,7 +930,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 25. 当前开发状态
+## 24. 当前开发状态
 
 ### 25.1 已完成
 
@@ -935,7 +975,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 ---
 
-## 26. 下一阶段实验
+## 25. 下一阶段实验
 
 LNBR 完成后，首先在相同 `grid/bent` 划分上与当前 Memory-bank baseline 比较：
 
@@ -971,7 +1011,7 @@ LNBR 完成后，首先在相同 `grid/bent` 划分上与当前 Memory-bank base
 
 ---
 
-## 27. 最终方案定位
+## 26. 最终方案定位
 
 最终目标不是单一异常分类器，也不是单纯的最近邻记忆检索系统，而是：
 
@@ -994,7 +1034,7 @@ LNBR 完成后，首先在相同 `grid/bent` 划分上与当前 Memory-bank base
 
 ---
 
-## 28. 参考资料
+## 27. 参考资料
 
 - [ConvNeXt V2](https://arxiv.org/abs/2301.00808)
 - [MVTec AD](https://www.mvtec.com/company/research/datasets/mvtec-ad)
@@ -1005,7 +1045,7 @@ LNBR 完成后，首先在相同 `grid/bent` 划分上与当前 Memory-bank base
 
 ---
 
-## 29. 说明
+## 28. 说明
 
 当前 Memory-bank 结果是已经完成并验证的强基线。
 
@@ -1020,3 +1060,176 @@ LNBR 完成后，首先在相同 `grid/bent` 划分上与当前 Memory-bank base
 - DFM/GAN 真实感异常生成。
 
 README 中对这些模块的描述表示项目设计目标，不代表相关实验已经全部完成。
+
+---
+
+## 29. 完整命令参考
+
+以下是从零开始运行训练到推理的完整命令流程。
+
+### 30.1 环境准备
+
+```bash
+# 安装依赖
+pip install torch>=2.1 torchvision>=0.16 "numpy<2" pandas pillow opencv-python-headless scikit-learn tqdm
+```
+
+### 30.2 数据划分
+
+```bash
+# 构建 public/support/query 划分
+# --target-dataset: 目标产线数据集 (mvtec_ad / dagm2007 / visa / mvtec_loco_ad)
+# --target-category: 目标类别 (如 grid, bottle, screw)
+# --unseen-type: 完全未见过的缺陷类型 (如 bent, broken_large)
+python main.py --config config.json make-split \
+    --target-dataset mvtec_ad \
+    --target-category grid \
+    --unseen-type bent \
+    --normal-budget 100 \
+    --anomaly-budget 30
+```
+
+### 30.3 公共工业预训练
+
+```bash
+# 在四个公开数据集上联合训练，学习通用工业异常特征
+# --split-dir: 指向 make-split 的输出目录
+python main.py --config config.json pretrain-public \
+    --split-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent
+
+# 可选：指定训练轮数和每轮步数
+python main.py --config config.json pretrain-public \
+    --split-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent \
+    --epochs 10 \
+    --steps-per-epoch 500
+```
+
+### 30.4 目标产线少样本迁移
+
+```bash
+# 用 100 张正常 + 30 张异常适配新产品线
+# 输出 target_model.pth 和 normal_reference.pth
+python main.py --config config.json adapt \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/normal \
+    --anomaly-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/anomaly
+
+# 禁用合成数据增强（可选）
+python main.py --config config.json adapt \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/normal \
+    --anomaly-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/anomaly \
+    --disable-synthetic
+```
+
+### 30.5 批量评估
+
+```bash
+# 在 query 集上评估 seen/unseen 异常检测精度
+python main.py --config config.json evaluate \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal \
+    --seen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/seen \
+    --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen
+```
+
+### 30.6 单张图片推理
+
+```bash
+# 正常品
+python main.py --config config.json infer-image \
+    --image data/mvtec_ad/grid/test/good/000.png
+
+# 见过的缺陷类型
+python main.py --config config.json infer-image \
+    --image data/mvtec_ad/grid/test/broken/000.png
+
+# 未见过的缺陷类型
+python main.py --config config.json infer-image \
+    --image data/mvtec_ad/grid/test/bent/000.png
+```
+
+### 30.7 视频推理
+
+```bash
+python main.py --config config.json infer-video \
+    --video /path/to/video.mp4 \
+    --frame-stride 5
+```
+
+### 30.8 可视化推理结果
+
+```bash
+# 单张图片可视化
+python vis_infer.py \
+    --image data/mvtec_ad/grid/test/bent/000.png
+
+# 按类别批量可视化
+python vis_infer.py \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal \
+    --seen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/seen \
+    --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen \
+    --save-dir vis_results \
+    --max-per-type 6
+```
+
+### 30.9 用户反馈
+
+```bash
+# 记录误报（模型判为异常，实际是正常）
+python main.py --config config.json feedback \
+    --image /path/to/false_positive.png \
+    --predicted-label 1 \
+    --corrected-label 0 \
+    --score 2.35 \
+    --defect-type false_positive \
+    --note "表面反光导致误判"
+
+# 记录漏报（模型判为正常，实际是异常）
+python main.py --config config.json feedback \
+    --image /path/to/false_negative.png \
+    --predicted-label 0 \
+    --corrected-label 1 \
+    --score 0.50 \
+    --defect-type missing_defect \
+    --note "细小裂纹未检出"
+
+# 周期重训（累积反馈满 20 条后触发）
+python main.py --config config.json feedback-retrain \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/normal \
+    --anomaly-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/anomaly \
+    --validation-normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal
+```
+
+### 30.10 完整从零开始脚本
+
+```bash
+#!/bin/bash
+# 从零到评估的完整流程
+
+# Step 1: 数据划分
+python main.py --config config.json make-split \
+    --target-dataset mvtec_ad \
+    --target-category grid \
+    --unseen-type bent
+
+# Step 2: 公共预训练
+python main.py --config config.json pretrain-public \
+    --split-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent
+
+# Step 3: 目标迁移
+python main.py --config config.json adapt \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/normal \
+    --anomaly-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/support/anomaly
+
+# Step 4: 评估
+python main.py --config config.json evaluate \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal \
+    --seen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/seen \
+    --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen
+
+# Step 5: 可视化
+python vis_infer.py \
+    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal \
+    --seen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/seen \
+    --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen \
+    --save-dir vis_results \
+    --max-per-type 6
+```
