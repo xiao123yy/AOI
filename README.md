@@ -245,7 +245,25 @@ AOI/
 - 适合 RTX 2060 等低算力设备；
 - 能为局部检测、全局检测和视频逻辑分支保留计算预算。
 
-### 5.2 ConvNeXt-L 的定位
+### 5.2 C²-FFN 快速骨干（实验模式）
+
+仓库同时提供 `c2_hard_b` 快速模式。该模式保留 ConvNeXtV2-Tiny
+的稠密深度卷积、残差路径和完整 `C→4C→C` 通道 FFN，但在 Stage 1–3
+中先按局部区域聚合 token，只在 128/32/8 个 centroid 上执行通道 FFN，
+再将更新写回原空间；Stage 4 仍保持原始 Dense ConvNeXt。
+
+该模式不改变多尺度接口，仍输出 F4、F8、F16 和 F32。启用方式：
+
+```json
+{
+  "backbone_mode": "c2_hard_b"
+}
+```
+
+默认值仍为 `dense`。C²-FFN 当前定位是可切换的实验加速模式，不作为
+Dense ConvNeXt 的无损替代；其训练权重应与 Dense 模式分别保存和加载。
+
+### 5.3 ConvNeXt-L 的定位
 
 项目中同时保留公开可用的 ConvNeXt-L 预训练权重：
 

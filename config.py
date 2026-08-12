@@ -39,6 +39,10 @@ class AOIConfig:
     topk_rois: int = 2
     local_top_ratio: float = 0.01
 
+    # Backbone implementation. Use c2_hard_b for the experimental
+    # cluster-centric FFN fast mode (128/32/8 centroids in stages 1-3).
+    backbone_mode: str = "dense"
+
     enable_memory_local: bool = True
     enable_roi_refinement: bool = False
     local_bank_chunk_size: int = 4096

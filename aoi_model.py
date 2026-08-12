@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from convnextv2 import load_convnextv2_tiny
+from modules.c2_ffn_convnext_v1 import load_c2_ffn_convnext_v1
 
 
 class GradientReversal(torch.autograd.Function):
@@ -39,11 +40,19 @@ class AOIMultiBranchModel(nn.Module):
         component_slots: int = 8,
         geometry_dims: int = 6,
         local_top_ratio: float = 0.01,
+        backbone_mode: str = "dense",
     ):
         super().__init__()
-        self.backbone = load_convnextv2_tiny(
-            student_checkpoint
-        )
+        if backbone_mode in ("dense", "standard"):
+            self.backbone = load_convnextv2_tiny(student_checkpoint)
+        elif backbone_mode in ("c2_hard_b", "c2_ffn_v1_b"):
+            self.backbone = load_c2_ffn_convnext_v1(
+                checkpoint=student_checkpoint,
+                proposal_hws=((2, 4), (2, 4), (2, 4)),
+            )
+        else:
+            raise ValueError(f"Unknown backbone_mode: {backbone_mode}")
+        self.backbone_mode = backbone_mode
         self.local_top_ratio = local_top_ratio
 
         self.local_head = nn.Sequential(

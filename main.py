@@ -29,6 +29,7 @@ def build_model(
         component_slots=config.component_slots,
         geometry_dims=config.geometry_dims,
         local_top_ratio=config.local_top_ratio,
+        backbone_mode=config.backbone_mode,
     )
 
     if full_checkpoint is None:
