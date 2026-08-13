@@ -228,6 +228,12 @@ class FewShotTransfer:
 
     def _autocast(self):
         if self.config.device.startswith("cuda") and self.config.amp:
+            # C²-FFN 的质心路由/聚合在 fp16 反向传播时会产生 NaN 梯度
+            # （F.normalize / scatter_add / gather 的 fp16 数值不稳定），
+            # GradScaler 会跳过所有含 NaN 的更新导致模型完全不学习。
+            # C² 模式强制 fp32 训练。
+            if self.model.backbone_mode in ("c2_hard_b", "c2_ffn_v1_b"):
+                return nullcontext()
             return torch.autocast(
                 device_type="cuda",
                 dtype=torch.float16,
@@ -248,6 +254,20 @@ class FewShotTransfer:
     # ------------------------------------------------------------------
     # Public industrial training
     # ------------------------------------------------------------------
+    def _stage_module(self, index: int) -> nn.Module:
+        """按骨干模式取第 index 个 stage 的模块。
+
+        dense: backbone.stages[index]；
+        c2_hard_b: Stage 0-2 为 backbone.c2_stages[index].blocks，
+                   Stage 3 为 backbone.stage4。
+        """
+        backbone = self.model.backbone
+        if self.model.backbone_mode in ("c2_hard_b", "c2_ffn_v1_b"):
+            if index == 3:
+                return backbone.stage4
+            return backbone.c2_stages[index].blocks
+        return backbone.stages[index]
+
     def _set_public_trainable(self) -> None:
         for parameter in self.model.parameters():
             parameter.requires_grad = False
@@ -264,9 +284,9 @@ class FewShotTransfer:
                 parameter.requires_grad = True
 
         for stage_index in [2, 3]:
-            for parameter in self.model.backbone.stages[
+            for parameter in self._stage_module(
                 stage_index
-            ].parameters():
+            ).parameters():
                 parameter.requires_grad = True
             for parameter in self.model.backbone.downsample_layers[
                 stage_index
@@ -598,11 +618,11 @@ class FewShotTransfer:
                 parameter.requires_grad = True
 
         if stage in {"stage4", "stage3"}:
-            for parameter in self.model.backbone.stages[3].parameters():
+            for parameter in self._stage_module(3).parameters():
                 parameter.requires_grad = True
 
         if stage == "stage3":
-            for block in self.model.backbone.stages[2][-2:]:
+            for block in self._stage_module(2)[-2:]:
                 for parameter in block.parameters():
                     parameter.requires_grad = True
 
@@ -612,9 +632,14 @@ class FewShotTransfer:
         for name, parameter in self.model.named_parameters():
             if not parameter.requires_grad:
                 continue
-            if name.startswith("backbone.stages.3"):
+            # dense: backbone.stages.N；c2: backbone.stage4 / backbone.c2_stages.N
+            if name.startswith("backbone.stages.3") or name.startswith(
+                "backbone.stage4"
+            ):
                 groups["stage4"].append(parameter)
-            elif name.startswith("backbone.stages.2"):
+            elif name.startswith("backbone.stages.2") or name.startswith(
+                "backbone.c2_stages.2"
+            ):
                 groups["stage3"].append(parameter)
             else:
                 groups["head"].append(parameter)
