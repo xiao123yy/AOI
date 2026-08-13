@@ -666,7 +666,11 @@ class NormalReference:
             "color_precision": self.color_precision,
             "geometry_mean": self.geometry_mean,
             "geometry_precision": self.geometry_precision,
-            "calibration": self.calibration.__dict__,
+            "calibration": (
+                self.calibration.__dict__
+                if self.calibration is not None
+                else None
+            ),
             "threshold": self.threshold,
         }
         torch.save(payload, path)
@@ -691,9 +695,12 @@ class NormalReference:
             "geometry_precision",
             "threshold",
         ]:
-            setattr(instance, key, payload[key])
-        instance.calibration = ScoreCalibration(
-            **payload["calibration"]
+            setattr(instance, key, payload.get(key))
+        calibration = payload.get("calibration")
+        instance.calibration = (
+            ScoreCalibration(**calibration)
+            if isinstance(calibration, dict)
+            else None
         )
         instance._clear_local_bank_cache()
         return instance

@@ -926,7 +926,9 @@ class FewShotTransfer:
         )
 
         # The normal reference must be extracted from the final adapted model.
-        self.reference.fit(self.model, train_normal)
+        # enable_reference=False 时完全跳过参考库，阈值按纯监督分校准。
+        if self.config.enable_reference:
+            self.reference.fit(self.model, train_normal)
         calibration_scores = self._combined_scores(validation_normal)
         calibration_scores = np.asarray(
             calibration_scores,

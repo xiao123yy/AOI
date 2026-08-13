@@ -16,6 +16,7 @@
   "topk_rois": 2,
   "local_top_ratio": 0.01,
   "backbone_mode": "c2_hard_b",
+  "enable_reference": false,
   "enable_memory_local": true,
   "enable_roi_refinement": false,
   "local_bank_chunk_size": 4096,

@@ -1,5 +1,6 @@
 {
   "backbone_mode": "dense",
+  "enable_reference": false,
   "root": ".",
   "student_checkpoint": "model/convnextv2_tiny_22k_384_ema.pt",
   "teacher_checkpoint": "model/convnext_large_22k_1k_224.pth",

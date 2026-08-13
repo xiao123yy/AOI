@@ -213,7 +213,15 @@ class AOIRealtimeDetector:
         color_feature = lab_statistics(image)
         geometry_feature = geometry_statistics(image)
 
-        if self.config.enable_memory_local:
+        if not self.config.enable_reference:
+            # 完全关闭正常参考库：融合时仅使用监督分数。
+            reference_scores = {
+                "memory_local": 0.0,
+                "memory_global": 0.0,
+                "color": 0.0,
+                "geometry": 0.0,
+            }
+        elif self.config.enable_memory_local:
             # GPU运算开始前同步，保证耗时统计准确。
             self._synchronize()
 
@@ -378,10 +386,15 @@ class AOIRealtimeDetector:
             ),
         }
 
-        dominant_branch = max(
-            branch_scores,
-            key=lambda key: branch_scores[key],
-        )
+        if not self.config.enable_reference:
+            # 参考库关闭时四个分支恒为 0.0，max 会误选它们；
+            # 此时主导分支恒为监督分。
+            dominant_branch = "supervised_global"
+        else:
+            dominant_branch = max(
+                branch_scores,
+                key=lambda key: branch_scores[key],
+            )
 
         return {
             "image": str(image_path),

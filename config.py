@@ -43,6 +43,9 @@ class AOIConfig:
     # cluster-centric FFN fast mode (128/32/8 centroids in stages 1-3).
     backbone_mode: str = "dense"
 
+    # False = 完全关闭正常参考库：推理只用监督分数，
+    # 阈值在 adapt 时按监督分单独校准。
+    enable_reference: bool = True
     enable_memory_local: bool = True
     enable_roi_refinement: bool = False
     local_bank_chunk_size: int = 4096
