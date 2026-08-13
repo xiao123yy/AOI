@@ -530,20 +530,24 @@ def build_public_and_target_split(
 
     anomalies = [record for record in target if record["label"] == 1]
     defect_types = sorted({record["defect_type"] for record in anomalies})
-    if unseen_type not in defect_types:
-        raise ValueError(
-            f"Unseen defect type '{unseen_type}' was not found. "
-            f"Available: {defect_types}"
-        )
-
-    query_unseen = [
-        record for record in anomalies
-        if record["defect_type"] == unseen_type
-    ]
-    seen_pool = [
-        record for record in anomalies
-        if record["defect_type"] != unseen_type
-    ]
+    if unseen_type:
+        if unseen_type not in defect_types:
+            raise ValueError(
+                f"Unseen defect type '{unseen_type}' was not found. "
+                f"Available: {defect_types}"
+            )
+        query_unseen = [
+            record for record in anomalies
+            if record["defect_type"] == unseen_type
+        ]
+        seen_pool = [
+            record for record in anomalies
+            if record["defect_type"] != unseen_type
+        ]
+    else:
+        # 无 unseen 保留：全部异常进入 support（单缺陷类型类别，如 toothbrush）。
+        query_unseen = []
+        seen_pool = anomalies
     support_anomaly = _balanced_take(
         seen_pool,
         anomaly_budget,
@@ -557,6 +561,8 @@ def build_public_and_target_split(
 
     experiment_name = (
         f"{target_dataset}_{target_category}_unseen_{unseen_type}"
+        if unseen_type
+        else f"{target_dataset}_{target_category}"
     )
     split_dir = config.split_root / experiment_name
     split_dir.mkdir(parents=True, exist_ok=True)

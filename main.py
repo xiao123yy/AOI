@@ -352,7 +352,14 @@ def create_parser() -> argparse.ArgumentParser:
     )
     split.add_argument("--target-dataset", default="mvtec_ad")
     split.add_argument("--target-category", default="grid")
-    split.add_argument("--unseen-type", default="bent")
+    split.add_argument(
+        "--unseen-type",
+        default=None,
+        help=(
+            "留作 unseen 的缺陷类型；缺省/空值时不保留 unseen，"
+            "全部异常进入 support（用于单缺陷类型类别）。"
+        ),
+    )
     split.add_argument("--normal-budget", type=int, default=100)
     split.add_argument("--anomaly-budget", type=int, default=30)
     split.add_argument(
