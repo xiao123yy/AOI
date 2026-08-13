@@ -168,6 +168,9 @@ class TargetDataset(Dataset):
             ),
             "label": torch.tensor(float(label)),
             "domain": torch.tensor(float(is_synthetic)),
+            "geometry": torch.from_numpy(
+                geometry_statistics(image)
+            ),
             "path": path,
         }
 
@@ -782,11 +785,26 @@ class FewShotTransfer:
                         if synthetic_probability > 0
                         else classification.new_tensor(0.0)
                     )
+                    # 结构/几何监督（E2 实验）：
+                    # 目标域异常视为组件级异常，直接监督 component/geometry 头，
+                    # 补上公共预训练中 structure 数据缺失导致的监督空白。
+                    component_loss = (
+                        F.binary_cross_entropy_with_logits(
+                            output["component_logits"].mean(dim=1),
+                            labels,
+                        )
+                    )
+                    geometry_loss = F.smooth_l1_loss(
+                        output["geometry"],
+                        batch["geometry"].to(self.config.device),
+                    )
                     loss = (
                         classification
                         + 0.25 * global_loss
                         + 0.25 * local_loss
                         + 0.05 * domain_loss
+                        + 0.2 * component_loss
+                        + 0.05 * geometry_loss
                     )
 
                 scaler.scale(loss).backward()
