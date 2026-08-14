@@ -161,17 +161,6 @@ class AOIRealtimeDetector:
             global_result["elapsed_ms"]
         )
 
-        supervised_heatmap = (
-            torch.sigmoid(
-                global_output[
-                    "local_logits"
-                ][0, 0]
-            )
-            .float()
-            .cpu()
-            .numpy()
-        )
-
         supervised_global = float(
             global_output[
                 "final_logit"
@@ -181,37 +170,11 @@ class AOIRealtimeDetector:
         )
 
         # =====================================================
-        # 2. 直接复用本次前向中的F16和F32
-        # 不再调用reference.score_image()
+        # 2. 正常参考评分（仅 enable_reference 时启用）
+        # 直接复用本次前向中的F16和F32，不再调用reference.score_image()；
+        # 参考库关闭时完全不提取特征，CPU 颜色/几何统计整段跳过。
         # =====================================================
         reference_start = time.perf_counter()
-
-        f16_feature = (
-            global_output["features"]["f16"][0]
-        )
-
-        local_tokens = (
-            f16_feature
-            .permute(1, 2, 0)
-            .reshape(
-                -1,
-                f16_feature.shape[0],
-            )
-            .contiguous()
-        )
-
-        global_feature = (
-            global_output[
-                "features"
-            ]["f32"]
-            .mean(dim=(-2, -1))[0]
-            .float()
-            .cpu()
-            .numpy()
-        )
-
-        color_feature = lab_statistics(image)
-        geometry_feature = geometry_statistics(image)
 
         if not self.config.enable_reference:
             # 完全关闭正常参考库：融合时仅使用监督分数。
@@ -221,29 +184,57 @@ class AOIRealtimeDetector:
                 "color": 0.0,
                 "geometry": 0.0,
             }
-        elif self.config.enable_memory_local:
-            # GPU运算开始前同步，保证耗时统计准确。
-            self._synchronize()
-
-            reference_scores = (
-                self.reference
-                .score_reused_features(
-                    local_tokens=local_tokens,
-                    global_feature=global_feature,
-                    color=color_feature,
-                    geometry=geometry_feature,
-                )
-            )
-
-            self._synchronize()
         else:
-            reference_scores = (
-                self.reference.score_fast_features(
-                    global_feature=global_feature,
-                    color=color_feature,
-                    geometry=geometry_feature,
-                )
+            f16_feature = (
+                global_output["features"]["f16"][0]
             )
+
+            local_tokens = (
+                f16_feature
+                .permute(1, 2, 0)
+                .reshape(
+                    -1,
+                    f16_feature.shape[0],
+                )
+                .contiguous()
+            )
+
+            global_feature = (
+                global_output[
+                    "features"
+                ]["f32"]
+                .mean(dim=(-2, -1))[0]
+                .float()
+                .cpu()
+                .numpy()
+            )
+
+            color_feature = lab_statistics(image)
+            geometry_feature = geometry_statistics(image)
+
+            if self.config.enable_memory_local:
+                # GPU运算开始前同步，保证耗时统计准确。
+                self._synchronize()
+
+                reference_scores = (
+                    self.reference
+                    .score_reused_features(
+                        local_tokens=local_tokens,
+                        global_feature=global_feature,
+                        color=color_feature,
+                        geometry=geometry_feature,
+                    )
+                )
+
+                self._synchronize()
+            else:
+                reference_scores = (
+                    self.reference.score_fast_features(
+                        global_feature=global_feature,
+                        color=color_feature,
+                        geometry=geometry_feature,
+                    )
+                )
 
         reference_ms = (
             time.perf_counter()
@@ -264,6 +255,18 @@ class AOIRealtimeDetector:
             self.config.enable_roi_refinement
             and self.config.topk_rois > 0
         ):
+            # ROI 精修关闭时无需把热力图转成 numpy，这里按需生成。
+            supervised_heatmap = (
+                torch.sigmoid(
+                    global_output[
+                        "local_logits"
+                    ][0, 0]
+                )
+                .float()
+                .cpu()
+                .numpy()
+            )
+
             boxes = self._select_rois(
                 image,
                 supervised_heatmap,

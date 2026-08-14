@@ -107,8 +107,6 @@ def load_deployed(
         len(unexpected),
     )
 
-    model.to(config.device)
-    model.eval()
     model.to(config.device).eval()
     reference = NormalReference.load(reference_path, config)
     return model, reference

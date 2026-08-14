@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
+import json
 from typing import Any, Iterable
 
 import cv2
@@ -587,7 +588,7 @@ class FewShotTransfer:
             output_path,
         )
         output_path.with_suffix(".history.json").write_text(
-            __import__("json").dumps(
+            json.dumps(
                 history,
                 ensure_ascii=False,
                 indent=2,
