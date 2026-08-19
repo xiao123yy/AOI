@@ -36,7 +36,7 @@
 
 - 输入支持图片和视频；
 - 原始工业图像分辨率可达到约 2500×2500；
-- RTX 2060 或以下 GPU 单图推理目标小于 200 ms；
+- RTX 2060 或以下 GPU 单图推理目标小于 200 ms；（2026-08-19 估算：2500×2500 端到端约 75–85 ms，见 §21）
 - CPU 单图推理目标小于 2 s；
 - 新产线适配阶段允许使用 100 张正常样本和 30 张异常样本；
 - 完成适配后，在后续 1000+ 测试样本上冻结模型；
@@ -51,17 +51,27 @@
 ```
 AOI/
 │
-├── main.py                              # 命令行统一入口（8 个命令）
+├── main.py                              # 命令行统一入口（10 个命令，见 §30）
 ├── aoi_model.py                         # 多尺度模型、6 个任务头 + 时序头
 ├── convnextv2.py                        # ConvNeXtV2-Tiny 骨干实现
 ├── config.py                            # 配置读取、路径解析和验证
 ├── config.json                          # 默认训练与部署配置
+├── config_nw0.json                      # num_workers=0 复现配置（受限环境/单卡）
 ├── example_config.json                  # 部署用精简配置示例
 ├── requirements.txt                     # Python 依赖
 ├── __init__.py
 ├── Question.png                         # 题目描述图
 │
-├── vis_infer.py                         # 推理可视化脚本（生成热力图对比）
+├── vis_infer.py                         # 推理可视化脚本（生成热力图三栏对比图）
+│
+├── scripts/
+│   └── run_experiment.py                # 2.3：单类一键跑完整管线（--all 跑五类）
+│
+├── experiments/                         # 2.3 五类统一基线产物（每类独立 workspace）
+│   ├── <数据集>_<类别>_<未见类型>/      #   config/checkpoints/deployment/evaluation
+│   └── summary.csv                      #   五类汇总指标（AUROC/FPR/召回/延迟）
+│
+├── vis_results/                         # 可视化产物（五类 × normal/seen/unseen 各 6 张）
 │
 ├── modules/
 │   ├── __init__.py
@@ -79,8 +89,7 @@ AOI/
 │
 ├── model/                               # 预训练权重目录
 │   ├── convnextv2_tiny_22k_384_ema.pt   # ConvNeXtV2-Tiny (ImageNet-22K, 110 MB)
-│   ├── convnext_large_22k_1k_224.pth    # ConvNeXt-Large (22K→1K, 755 MB)
-│   └── model.txt
+│   └── model.txt                        # 注：ConvNeXt-Large 教师权重已于 2026-08-19 清理移除（预留未用）
 │
 ├── data/                                # 工业数据集
 │   ├── mvtec_ad/                        # MVTec AD（bottle/cable/.../grid/.../zipper 共15类）
@@ -102,41 +111,15 @@ AOI/
 │   ├── training/
 │   └── ...
 │
-└── aoi_full_workspace/                  # 运行产出（自动生成，可删除重建）
-    ├── checkpoints/
-    │   ├── industrial_pretrained.pth    # 公共预训练权重
-    │   └── industrial_pretrained.history.json  # 训练历史
-    │
-    ├── splits/
-    │   └── mvtec_ad_grid_unseen_bent/   # 实验划分（grid 为目标，bent 为未见）
-    │       ├── public_train.jsonl       # MVTec+DAGM 公共训练清单
-    │       ├── public_val.jsonl         # 公共验证清单
-    │       ├── summary.json             # 划分统计
-    │       ├── support/
-    │       │   ├── normal/              # ~100 张正常图
-    │       │   └── anomaly/             # ~30 张异常图（broken/glue/metal/thread）
-    │       ├── query/
-    │       │   ├── normal/              # ~21 张测试正常图
-    │       │   ├── seen/                # ~15 张已见过缺陷图
-    │       │   └── unseen/              # ~12 张未见缺陷图（bent）
-    │       ├── query_normal.jsonl
-    │       ├── query_seen.jsonl
-    │       └── query_unseen.jsonl
-    │
-    ├── deployment/                      # 最终部署产物
+└── aoi_full_workspace/                  # 运行产物（2026-08-19 清理后仅剩 deployment/ + evaluation/）
+    ├── deployment/                      # 最终部署产物（当前为 transistor 2.3 版，可随时由 experiments/ 重建）
     │   ├── target_model.pth             # 迁移后的完整模型权重
     │   └── normal_reference.pth         # 正常参考库（阈值 + 特征库）
     │
-    ├── evaluation/                      # 批量评估结果
-    │   ├── metrics.json                 # 汇总指标（AUROC/F1/延迟等）
-    │   ├── predictions.csv              # 每张图的预测详情
-    │   └── failed_cases.csv             # 预测错误的样本
-    │
-    ├── feedback/                        # 用户反馈（运行时生成）
-    │   ├── feedback.jsonl               # 反馈日志
-    │   └── rollback/                    # 重训前的模型备份
-    │
-    └── logs/                            # 训练日志
+    └── evaluation/
+        └── metrics.json                 # 最近一次评估（check-deploy 校验与部署阈值一致）
+    # 注：checkpoints/splits/feedback/logs 等历史产物已随清理移除；
+    #     每类完整产物（config/checkpoints/deployment/evaluation）见 experiments/<tag>/
 ```
 
 ---
@@ -826,13 +809,20 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 但当前高精度依赖非参数 Memory-bank，因此下一阶段需要使用 LNBR 替代，并与当前强基线进行公平对比。
 
-当前延迟仅在现有服务器和 384×384 输入上验证，尚未完成：
+**现状更新（2026-08-19）**：上述 Memory-bank 为早期基线；当前主线为
+"dense 纯监督 + conformal+margin 阈值"（`enable_reference=false`），已完成的工作：
 
-- RTX 2060 正式测速；
-- CPU 正式测速；
-- 2500×2500 原图推理验证；
-- 多类别重复实验；
-- 多数据集重复实验。
+- **五类统一基线（2.3）**：grid / leather / capsule / transistor / dagm Class3 同配置全跑完，
+  汇总见 `experiments/summary.csv` 与《项目详解.md §16.8》《比赛技术报告.md §14.5》；
+  3/5 类达标（grid：FPR 0%、unseen 召回 100%；dagm Class3：FPR 5.1%、召回 99.2%），
+  leather/capsule 的 FPR 略超 6%（30 张校准样本的类别方差）、transistor 属模型上限难类（如实记录）；
+- **2500×2500 单图端到端**：1.1 CPU 预处理向量化后 **50.3 ms（median）/ 53.0 ms（P95）**；
+  2026-08-19 复核（当前 transistor 部署）实测 **61–63 ms（median）/ ~66 ms（P95）**，
+  差异为机器态与输入图波动，流水线未回退（拆解：骨干前向 ~15–16 ms + CPU 处理 ~45 ms）；
+- **RTX 2060 估算**：骨干前向按算力/带宽外推 ~28–35 ms，CPU 段不变，估计 2500×2500 端到端
+  **75–85 ms（P95 ~85–95 ms）**，满足赛题 <200 ms 目标；2060 6GB 显存推理无压力
+  （训练需 `num_workers=0` + AMP）；
+- **五类可视化**：`vis_results/` 下五类 × normal/seen/unseen 共 78 张三栏对比图（原图/热力图/F16 激活 + 分支分数）。
 
 ---
 
@@ -982,7 +972,13 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 - 2500×2500 Dense ConvNeXt 延迟验证；
 - C²-FFN Hard-B（Stage 1–3 使用 128/32/8 centroids，Stage 4 Dense）；
 - Dense/C² 严格匹配速度与 AUROC 对照；
-- C² 模式与 Dense 模式统一 F4/F8/F16/F32 输出接口。
+- C² 模式与 Dense 模式统一 F4/F8/F16/F32 输出接口；
+- 阈值校准稳健化（conformal 分位 + margin，30% 校准样本）；
+- 反馈重训三守卫验证/回滚（漂移哨兵尺度感知，4/4 用例通过）；
+- 五类统一基线（2.3）与每类独立部署/评估产物（`experiments/` + `summary.csv`）；
+- 20%→30% 校准样本的 2.1 机制在 grid 上验证通过（FPR 11%→0%）；
+- 2500×2500 延迟复核与 RTX 2060 估算（见 §21）；
+- 五类可视化产物（`vis_results/`）。
 
 ### 25.2 正在重构
 
@@ -1001,9 +997,7 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 - 四类异质异常统一 Mask 输出；
 - DFM/GAN 真实感缺陷生成；
 - 真实产线视频序列训练；
-- RTX 2060 延迟验证；
-- CPU 延迟验证；
-- 多目标类别重复实验；
+- RTX 2060 / CPU 正式测速（当前为估算值，见 §21）；
 - LNBR 与 Memory-bank 公平消融实验；
 - 完整 AOI 系统完成后的 Dense/C² 端到端速度—精度复测。
 
@@ -1195,13 +1189,15 @@ python main.py --config config.json infer-video \
 python vis_infer.py \
     --image data/mvtec_ad/grid/test/bent/000.png
 
-# 按类别批量可视化
-python vis_infer.py \
-    --normal-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/normal \
-    --seen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/seen \
-    --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen \
-    --save-dir vis_results \
+# 按类别批量可视化（--config 指向该类独立部署；路径为 2.3 五类实验中实测可用的）
+python vis_infer.py --config experiments/mvtec_ad_grid_unseen_bent/config.json \
+    --normal-dir  experiments/mvtec_ad_grid_unseen_bent/splits/mvtec_ad_grid_unseen_bent/query/normal \
+    --seen-dir    experiments/mvtec_ad_grid_unseen_bent/splits/mvtec_ad_grid_unseen_bent/query/seen \
+    --unseen-dir  experiments/mvtec_ad_grid_unseen_bent/splits/mvtec_ad_grid_unseen_bent/query/unseen \
+    --save-dir vis_results/mvtec_ad_grid_unseen_bent \
     --max-per-type 6
+# 其余四类把 tag 换成 leather_unseen_fold / capsule_unseen_crack / transistor_unseen_bent_lead / dagm2007_Class3 即可
+# （已产出五类共 78 张三栏对比图，见 vis_results/）
 ```
 
 ### 30.9 用户反馈
@@ -1266,4 +1262,30 @@ python vis_infer.py \
     --unseen-dir aoi_full_workspace/splits/mvtec_ad_grid_unseen_bent/query/unseen \
     --save-dir vis_results \
     --max-per-type 6
+```
+
+### 30.11 阈值扫描与部署一致性
+
+```bash
+# 评估时同时输出最优 F1 点与 P@FPR=target% 点（C1 threshold sweep）
+python main.py --config config.json evaluate \
+    --normal-dir .../query/normal --seen-dir .../query/seen --unseen-dir .../query/unseen \
+    --threshold-sweep
+
+# 核对部署阈值与最近一次评估记录一致（C4，输出 consistent 字段）
+python main.py --config config.json check-deploy
+```
+
+### 30.12 zero-shot 命令（不训练直接定阈值）
+
+```bash
+# ≥5 张正常图建库 + conformal+margin 定阈值，不训练模型
+python main.py --config config.json zero-shot-adapt --normal-dir /path/to/normal_images
+```
+
+### 30.13 五类统一基线一键复现（2.3）
+
+```bash
+# 顺序跑五类完整管线（grid/leather/capsule/transistor/dagm Class3，各 ≈43 分钟，全程 ~3.6h）
+python scripts/run_experiment.py --all --base-config config_nw0.json
 ```
