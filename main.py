@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from config import AOIConfig
@@ -216,7 +217,153 @@ def command_evaluate(args, config: AOIConfig) -> None:
         seen_anomaly_paths=seen_paths,
         unseen_anomaly_paths=unseen_paths,
         output_dir=config.workspace_path / "evaluation",
+        threshold_sweep=args.threshold_sweep,
     )
+
+
+def command_zero_shot_adapt(args, config: AOIConfig) -> None:
+    """无样本冷启动：不训练，只用正常图建参考库 + conformal 阈值。
+
+    对应《优化计划》2.2：交付"无样本启动"命令行封装。
+    阈值口径与 adapt 完全一致：部署同款评分流程 + 有限样本
+    conformal 分位点 + threshold_margin（在全部正常图上校准，
+    样本量比 adapt 的验证子集更大）。
+    """
+    normal_paths = list_images(args.normal_dir)
+    if len(normal_paths) < 5:
+        raise ValueError(
+            "zero-shot 至少需要 5 张正常图："
+            f"实际 {len(normal_paths)} 张。"
+        )
+    if not config.industrial_checkpoint_path.exists():
+        raise FileNotFoundError(
+            "Industrial pretrained checkpoint does not exist: "
+            f"{config.industrial_checkpoint_path}\n"
+            "Run pretrain-public first."
+        )
+
+    model = build_model(
+        config,
+        full_checkpoint=config.industrial_checkpoint_path,
+    )
+    transfer = FewShotTransfer(config, model)
+
+    reference = transfer.build_zero_shot_reference(normal_paths)
+
+    # 阈值：部署同款流程对全部正常图打分 → conformal 分位点 + margin。
+    target_fpr = float(config.target_normal_fpr)
+    scores = np.sort(
+        np.asarray(
+            transfer._combined_scores(normal_paths),
+            dtype=np.float64,
+        )
+    )
+    sample_count = len(scores)
+    rank = int(
+        np.ceil((sample_count + 1) * (1.0 - target_fpr))
+    ) - 1
+    rank = min(max(rank, 0), sample_count - 1)
+
+    margin_scale = float(
+        getattr(config, "threshold_margin", 0.0)
+    )
+    margin = 0.0
+    if margin_scale > 0.0:
+        margin = margin_scale * max(
+            0.05,
+            0.1 * float(scores.std()),
+        )
+    reference.threshold = float(scores[rank] + margin)
+
+    deployment_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else config.workspace_path / "deployment"
+    )
+    deployment_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        model.state_dict(),
+        deployment_dir / "target_model.pth",
+    )
+    reference.save(deployment_dir / "normal_reference.pth")
+
+    print(
+        json.dumps(
+            {
+                "normal_count": sample_count,
+                "target_fpr": target_fpr,
+                "rank": rank,
+                "margin_scale": margin_scale,
+                "threshold_margin": float(margin),
+                "threshold": reference.threshold,
+                "model": str(
+                    deployment_dir / "target_model.pth"
+                ),
+                "reference": str(
+                    deployment_dir / "normal_reference.pth"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def command_check_deploy(args, config: AOIConfig) -> None:
+    """C4：部署产物与最近一次评估的一致性检查。
+
+    防止"adapt 重新生成部署后评估已过期"导致
+    部署阈值与评估记录不匹配。
+    """
+    _, reference = load_deployed(config)
+    deployed_threshold = reference.threshold
+
+    metrics_path = (
+        config.workspace_path / "evaluation" / "metrics.json"
+    )
+    result: dict = {
+        "deployment_threshold": deployed_threshold,
+        "metrics_path": str(metrics_path),
+        "metrics_threshold": None,
+        "consistent": None,
+        "warning": None,
+    }
+
+    if not metrics_path.exists():
+        result["warning"] = (
+            "evaluation/metrics.json 不存在："
+            "尚无评估记录，无法核对部署点。"
+        )
+    else:
+        metrics = json.loads(
+            metrics_path.read_text(encoding="utf-8")
+        )
+        recorded = metrics.get("deploy_threshold")
+        if recorded is None:
+            result["warning"] = (
+                "metrics.json 缺少 deploy_threshold 字段"
+                "（旧版评估记录）：请重跑 evaluate 以核对当前部署点。"
+            )
+        else:
+            result["metrics_threshold"] = recorded
+            result["consistent"] = (
+                deployed_threshold is not None
+                and abs(
+                    float(deployed_threshold) - float(recorded)
+                )
+                <= 1e-6
+            )
+            if not result["consistent"]:
+                result["warning"] = (
+                    "部署阈值与最近评估记录不一致："
+                    "部署产物在评估之后被重新生成，评估已过期，"
+                    "请重跑 evaluate。"
+                )
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result["warning"]:
+        print("[check-deploy] WARNING:", result["warning"])
 
 
 def command_infer_image(args, config: AOIConfig) -> None:
@@ -305,6 +452,11 @@ def command_feedback_retrain(args, config: AOIConfig) -> None:
         reference=reference,
     )
 
+    validation_anomaly = (
+        list_images(args.validation_anomaly_dir)
+        if args.validation_anomaly_dir
+        else []
+    )
     result = manager.periodic_retrain(
         transfer=transfer,
         original_normal_paths=list_images(args.normal_dir),
@@ -312,6 +464,7 @@ def command_feedback_retrain(args, config: AOIConfig) -> None:
         validation_normal_paths=list_images(
             args.validation_normal_dir
         ),
+        validation_anomaly_paths=validation_anomaly or None,
         model_path=(
             config.workspace_path
             / "deployment"
@@ -400,7 +553,36 @@ def create_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--normal-dir", required=True)
     evaluate.add_argument("--seen-dir", default="")
     evaluate.add_argument("--unseen-dir", default="")
+    evaluate.add_argument(
+        "--threshold-sweep",
+        action="store_true",
+        help=(
+            "C1：额外输出最优 F1 工作点与 P@FPR=5%% 两个口径，"
+            "区分模型上限与部署点。"
+        ),
+    )
     evaluate.set_defaults(function=command_evaluate)
+
+    zero_shot = subparsers.add_parser(
+        "zero-shot-adapt",
+        help=(
+            "Zero-shot cold start: build the normal reference from "
+            "normal images only, no training"
+        ),
+    )
+    zero_shot.add_argument("--normal-dir", required=True)
+    zero_shot.add_argument(
+        "--output-dir",
+        default="",
+        help="Defaults to <workspace>/deployment",
+    )
+    zero_shot.set_defaults(function=command_zero_shot_adapt)
+
+    check = subparsers.add_parser(
+        "check-deploy",
+        help="Check deployment artifacts against the latest evaluation",
+    )
+    check.set_defaults(function=command_check_deploy)
 
     image = subparsers.add_parser(
         "infer-image",
@@ -448,6 +630,11 @@ def create_parser() -> argparse.ArgumentParser:
     retrain.add_argument(
         "--validation-normal-dir",
         required=True,
+    )
+    retrain.add_argument(
+        "--validation-anomaly-dir",
+        default="",
+        help="可选：验证异常图目录，提供后重训后额外校验 AUROC",
     )
     retrain.set_defaults(function=command_feedback_retrain)
     return parser

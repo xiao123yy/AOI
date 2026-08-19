@@ -61,7 +61,7 @@ class AOIConfig:
 
     # Public industrial training.
     public_batch_size: int = 8
-    public_num_workers: int = 2
+    public_num_workers: int = 4
     public_epochs: int = 5
     public_steps_per_epoch: int = 300
     public_lr_head: float = 2e-4
@@ -76,7 +76,7 @@ class AOIConfig:
 
     # Target 100-normal + 30-anomaly transfer.
     batch_size: int = 8
-    num_workers: int = 2
+    num_workers: int = 4
     head_epochs: int = 3
     stage4_epochs: int = 3
     stage3_epochs: int = 3
@@ -99,6 +99,11 @@ class AOIConfig:
     rollback_tolerance: float = 0.01
 
     target_normal_fpr: float = 0.05
+
+    # 阈值安全 margin 系数（2.1 阈值校准稳健化）。
+    # 0.0 = 旧行为（阈值 = conformal 分位点本身）；
+    # >0 时 threshold = 分位点 + margin_scale * max(0.05, 0.1*std(校准分))。
+    threshold_margin: float = 0.0
 
     @property
     def root_path(self) -> Path:
@@ -141,6 +146,15 @@ class AOIConfig:
             )
 
     def validate_paths(self) -> None:
+        if self.backbone_mode != "dense":
+            # C²-FFN 实验已证不可用（目标域 AUROC 0.446 vs dense 0.965，
+            # 端到端延迟无收益），在配置层直接拦截，避免误用旧配置。
+            raise ValueError(
+                "backbone_mode 仅支持 'dense'："
+                f"收到 {self.backbone_mode!r}。C²-FFN 实验性骨干"
+                "已验证不可用，见《项目详解》12.2 / 《优化计划》C2。"
+            )
+
         if not self.student_checkpoint_path.exists():
             raise FileNotFoundError(
                 "Student checkpoint does not exist: "
@@ -198,8 +212,10 @@ class AOIConfig:
                 f"Config file not found: {config_path}"
             )
 
+        # utf-8-sig: tolerates a leading BOM (Windows editors, e.g. Notepad,
+        # save UTF-8 configs with BOM by default) while accepting BOM-less files.
         data = json.loads(
-            config_path.read_text(encoding="utf-8")
+            config_path.read_text(encoding="utf-8-sig")
         )
         base_dir = config_path.parent
 

@@ -33,16 +33,37 @@ from modules.realtime_detection import (
 )
 
 
+def _worker_rng(dataset) -> np.random.Generator:
+    """返回 dataset 的 rng，并按 DataLoader worker 重播种。
+
+    多 worker 下各 worker 共享同一 dataset 对象（含同一初始随机状态），
+    按 worker id 重播种可避免所有 worker 对同一样本做完全相同的增强。
+    """
+    info = torch.utils.data.get_worker_info()
+    worker_id = 0 if info is None else info.id
+    if worker_id != getattr(dataset, "_rng_worker_id", None):
+        dataset._rng_worker_id = worker_id
+        dataset.rng = np.random.default_rng(
+            dataset.seed + worker_id * 1000003
+        )
+    return dataset.rng
+
+
 class PublicIndustrialDataset(Dataset):
     def __init__(
         self,
         records: list[dict[str, Any]],
         config: AOIConfig,
         training: bool,
+        seed: int = 42,
     ):
         self.records = records
         self.config = config
         self.training = training
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
+        # 几何统计按路径缓存：避免每 epoch 对全量图片重跑 Canny/轮廓。
+        self._geometry_cache: dict[str, np.ndarray] = {}
 
         if not records:
             raise ValueError("Public industrial dataset is empty.")
@@ -71,24 +92,49 @@ class PublicIndustrialDataset(Dataset):
 
         return torch.from_numpy(array)[None], 1.0
 
+    def _cached_geometry(
+        self,
+        path: str,
+        horizontal_flip: bool,
+    ) -> np.ndarray:
+        """按路径缓存几何统计（原图计算一次，跨 epoch 复用）。
+
+        旧实现对增强后的图计算；此处改在原图上计算：
+        翻转样本只修正 x 中心（宽高/面积/周长在左右翻转下不变），
+        亮度/对比度 ±10% 对 Canny 边缘的影响可忽略。
+        """
+        cached = self._geometry_cache.get(path)
+        if cached is None:
+            cached = geometry_statistics(load_rgb(path))
+            self._geometry_cache[path] = cached
+        if horizontal_flip:
+            flipped = cached.copy()
+            flipped[2] = 1.0 - flipped[2] - flipped[0]
+            return flipped
+        return cached
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         image = load_rgb(record["path"])
         horizontal_flip = False
+        rng = _worker_rng(self)
 
         if self.training:
-            horizontal_flip = np.random.random() < 0.5
+            horizontal_flip = rng.random() < 0.5
             if horizontal_flip:
                 image = image.transpose(Image.FLIP_LEFT_RIGHT)
 
             image = ImageEnhance.Brightness(image).enhance(
-                float(np.random.uniform(0.9, 1.1))
+                float(rng.uniform(0.9, 1.1))
             )
             image = ImageEnhance.Contrast(image).enhance(
-                float(np.random.uniform(0.9, 1.1))
+                float(rng.uniform(0.9, 1.1))
             )
 
-        geometry = geometry_statistics(image)
+        geometry = self._cached_geometry(
+            str(record["path"]),
+            horizontal_flip,
+        )
         image_tensor = normalize_image(
             image,
             self.config.train_size,
@@ -122,11 +168,14 @@ class TargetDataset(Dataset):
         training: bool = True,
         synthetic_engine: SyntheticEngine | None = None,
         synthetic_probability: float = 0.0,
+        seed: int = 42,
     ):
         self.config = config
         self.training = training
         self.synthetic_engine = synthetic_engine
         self.synthetic_probability = synthetic_probability
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
         self.items = [
             (path, 0) for path in normal_paths
         ] + [
@@ -143,14 +192,15 @@ class TargetDataset(Dataset):
         path, label = self.items[index]
         image = load_rgb(path)
         is_synthetic = 0
+        rng = _worker_rng(self)
 
         if (
             self.training
             and label == 0
             and self.synthetic_engine is not None
-            and np.random.random() < self.synthetic_probability
+            and rng.random() < self.synthetic_probability
         ):
-            generator = np.random.choice(
+            generator = rng.choice(
                 ["appearance", "color", "geometry"]
             )
             if generator == "appearance":
@@ -897,8 +947,10 @@ class FewShotTransfer:
         rng.shuffle(normal_array)
         rng.shuffle(anomaly_array)
 
-        normal_val_count = max(5, round(len(normal_array) * 0.2))
-        normal_val_count = min(normal_val_count, len(normal_array) - 5)
+        # 2.1 阈值校准稳健化：校准集从 20% 提升到 30%（100 张时 20→30），
+        # 降低阈值对"校准集里最异常那张正常图"的敏感度。
+        normal_val_count = max(8, round(len(normal_array) * 0.3))
+        normal_val_count = min(normal_val_count, len(normal_array) - 8)
         anomaly_val_count = max(1, round(len(anomaly_array) * 0.2))
         anomaly_val_count = min(anomaly_val_count, len(anomaly_array) - 1)
 
@@ -988,8 +1040,21 @@ class FewShotTransfer:
             sample_count - 1,
         )
 
+        # 2.1 阈值安全 margin：阈值 = conformal 分位点
+        # + threshold_margin * max(0.05, 0.1*std(校准分))。
+        # threshold_margin=0 时保持旧行为（便于 A/B 对比）。
+        margin_scale = float(
+            getattr(self.config, "threshold_margin", 0.0)
+        )
+        threshold_margin = 0.0
+        if margin_scale > 0.0:
+            threshold_margin = margin_scale * max(
+                0.05,
+                0.1 * float(calibration_scores.std()),
+            )
+
         self.reference.threshold = float(
-            calibration_scores[rank]
+            calibration_scores[rank] + threshold_margin
         )
 
         print(
@@ -1007,6 +1072,10 @@ class FewShotTransfer:
                 ),
                 "rank": rank,
                 "target_fpr": target_fpr,
+                "margin_scale": margin_scale,
+                "threshold_margin": float(
+                    threshold_margin
+                ),
                 "threshold": (
                     self.reference.threshold
                 ),

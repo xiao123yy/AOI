@@ -42,36 +42,88 @@ def load_rgb(path: str | Path) -> Image.Image:
         return image.convert("RGB")
 
 
+def load_rgb_array(path: str | Path) -> np.ndarray:
+    """一次解码返回 RGB uint8 HWC ndarray。
+
+    cv2.imdecode 比 PIL 解码快，且免 PIL<->numpy 往返；
+    推理侧（inspect_image）解码一次，骨干前向 / LAB / 几何
+    统计共享同一数组，避免同一张大图被全图转换 3 次。
+    训练侧继续使用 PIL 路径（load_rgb + normalize_image），不受影响。
+    """
+    buffer = np.fromfile(str(path), dtype=np.uint8)
+    array = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+    if array is None:
+        raise ValueError(f"Cannot decode image: {path}")
+    return cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+
+
+def _to_rgb_array(image: Image.Image) -> np.ndarray:
+    return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
 def normalize_image(
     image: Image.Image,
     size: int,
 ) -> torch.Tensor:
+    # 训练侧路径保持不变（PIL BICUBIC），避免改变既有训练行为。
     image = image.resize((size, size), Image.BICUBIC)
     array = np.asarray(image, dtype=np.float32) / 255.0
     array = (array - IMAGENET_MEAN) / IMAGENET_STD
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
+def normalize_array(
+    rgb: np.ndarray,
+    size: int,
+) -> torch.Tensor:
+    """推理侧快速归一化，免全图 np.asarray 往返。
+
+    插值与训练侧保持一致（PIL BICUBIC）：
+    cv2.INTER_CUBIC 与 PIL BICUBIC 的核不同，2500² 大图上实测
+    归一化空间最大像素差 ~1.08，会改变骨干输入；
+    而 Image.fromarray 只是包装 cv2 解码好的缓冲区（零拷贝），
+    PIL resize 只处理 384² 输出，代价可忽略。
+    """
+    if max(rgb.shape[:2]) > size:
+        resized = Image.fromarray(rgb).resize(
+            (size, size),
+            Image.BICUBIC,
+        )
+        array = np.asarray(resized, dtype=np.float32) / 255.0
+    else:
+        array = rgb.astype(np.float32) / 255.0
+    array = (array - IMAGENET_MEAN) / IMAGENET_STD
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
 def lab_statistics(image: Image.Image) -> np.ndarray:
-    rgb = _downscale_array(
-        np.asarray(image.convert("RGB"), dtype=np.uint8),
-        LAB_FEATURE_MAX_SIDE,
-    )
+    return lab_statistics_array(_to_rgb_array(image))
+
+
+def lab_statistics_array(rgb: np.ndarray) -> np.ndarray:
+    rgb = _downscale_array(rgb, LAB_FEATURE_MAX_SIDE)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
 
     means = lab.reshape(-1, 3).mean(axis=0)
     stds = lab.reshape(-1, 3).std(axis=0)
 
+    # 3 通道 16 桶直方图向量化（与旧版逐通道 cv2.calcHist 等价：
+    # bin = min(v // 16, 15)，v 为 uint8 LAB 值）。
+    lab_u8 = lab.astype(np.uint8)
+    bins = np.minimum(lab_u8.reshape(-1, 3) // 16, 15)
+    offsets = np.repeat(
+        np.array([0, 16, 32], dtype=np.int64),
+        bins.shape[0],
+    )
+    counts = np.bincount(
+        bins.ravel() + offsets,
+        minlength=48,
+    ).astype(np.float64)
+
     histograms = []
     for channel in range(3):
-        histogram = cv2.calcHist(
-            [lab.astype(np.uint8)],
-            [channel],
-            None,
-            [16],
-            [0, 256],
-        ).reshape(-1)
-        histogram /= histogram.sum() + 1e-6
+        histogram = counts[channel * 16 : (channel + 1) * 16]
+        histogram = histogram / (histogram.sum() + 1e-6)
         histograms.append(histogram)
 
     return np.concatenate([means, stds, *histograms]).astype(
@@ -80,10 +132,19 @@ def lab_statistics(image: Image.Image) -> np.ndarray:
 
 
 def geometry_statistics(image: Image.Image) -> np.ndarray:
-    rgb = _downscale_array(
-        np.asarray(image.convert("RGB"), dtype=np.uint8),
-        GEOMETRY_FEATURE_MAX_SIDE,
+    return geometry_statistics_array(
+        _to_rgb_array(image),
+        image.width,
+        image.height,
     )
+
+
+def geometry_statistics_array(
+    rgb: np.ndarray,
+    orig_width: int,
+    orig_height: int,
+) -> np.ndarray:
+    rgb = _downscale_array(rgb, GEOMETRY_FEATURE_MAX_SIDE)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     contours, _ = cv2.findContours(
@@ -100,12 +161,12 @@ def geometry_statistics(image: Image.Image) -> np.ndarray:
 
     return np.array(
         [
-            width / max(1, image.width),
-            height / max(1, image.height),
-            x / max(1, image.width),
-            y / max(1, image.height),
-            area / max(1, image.width * image.height),
-            perimeter / max(1, image.width + image.height),
+            width / max(1, orig_width),
+            height / max(1, orig_height),
+            x / max(1, orig_width),
+            y / max(1, orig_height),
+            area / max(1, orig_width * orig_height),
+            perimeter / max(1, orig_width + orig_height),
         ],
         dtype=np.float32,
     )

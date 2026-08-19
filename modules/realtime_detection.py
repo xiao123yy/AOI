@@ -12,7 +12,10 @@ import torch
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
+    f1_score,
     precision_recall_fscore_support,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 
@@ -20,10 +23,11 @@ from config import AOIConfig
 from aoi_model import AOIMultiBranchModel, TemporalLogicHead
 from modules.normal_reference import NormalReference
 from utils.image import (
-    geometry_statistics,
-    lab_statistics,
-    load_rgb,
+    geometry_statistics_array,
+    lab_statistics_array,
+    load_rgb_array,
     nms_boxes,
+    normalize_array,
     normalize_image,
 )
 
@@ -62,12 +66,17 @@ class AOIRealtimeDetector:
     @torch.inference_mode()
     def _forward_pil(
         self,
-        image: Image.Image,
+        image: Image.Image | np.ndarray,
         size: int,
     ) -> dict:
-        tensor = normalize_image(image, size)[None].to(
-            self.config.device
-        )
+        if isinstance(image, np.ndarray):
+            tensor = normalize_array(image, size)[None].to(
+                self.config.device
+            )
+        else:
+            tensor = normalize_image(image, size)[None].to(
+                self.config.device
+            )
         self._synchronize()
         start = time.perf_counter()
         output = self.model(tensor)
@@ -80,11 +89,14 @@ class AOIRealtimeDetector:
 
     def _select_rois(
         self,
-        image: Image.Image,
+        image: Image.Image | np.ndarray,
         heatmap: np.ndarray,
     ) -> list[tuple[int, int, int, int]]:
         heatmap_height, heatmap_width = heatmap.shape
-        original_width, original_height = image.size
+        if isinstance(image, np.ndarray):
+            original_height, original_width = image.shape[:2]
+        else:
+            original_width, original_height = image.size
         candidate_count = min(
             self.config.topk_rois * 8,
             heatmap_height * heatmap_width,
@@ -143,7 +155,9 @@ class AOIRealtimeDetector:
         self,
         image_path: str | Path,
     ) -> dict:
-        image = load_rgb(image_path)
+        # 一次 cv2 解码：骨干前向 / LAB / 几何统计共享同一数组，
+        # 避免同一张大图被全图转换 3 次 + PIL<->numpy 往返。
+        image = load_rgb_array(image_path)
 
         self._synchronize()
         total_start = time.perf_counter()
@@ -209,8 +223,12 @@ class AOIRealtimeDetector:
                 .numpy()
             )
 
-            color_feature = lab_statistics(image)
-            geometry_feature = geometry_statistics(image)
+            color_feature = lab_statistics_array(image)
+            geometry_feature = geometry_statistics_array(
+                image,
+                image.shape[1],
+                image.shape[0],
+            )
 
             if self.config.enable_memory_local:
                 # GPU运算开始前同步，保证耗时统计准确。
@@ -275,11 +293,11 @@ class AOIRealtimeDetector:
             if boxes:
                 roi_batch = torch.stack(
                     [
-                        normalize_image(
-                            image.crop(box),
+                        normalize_array(
+                            image[y0 : y1, x0 : x1],
                             self.config.roi_size,
                         )
-                        for box in boxes
+                        for (x0, y0, x1, y1) in boxes
                     ]
                 ).to(self.config.device)
 
@@ -444,6 +462,7 @@ class AOIRealtimeDetector:
         seen_anomaly_paths: list[str] | None = None,
         unseen_anomaly_paths: list[str] | None = None,
         output_dir: str | Path | None = None,
+        threshold_sweep: bool = False,
     ) -> dict:
         seen_anomaly_paths = seen_anomaly_paths or []
         unseen_anomaly_paths = unseen_anomaly_paths or []
@@ -504,6 +523,12 @@ class AOIRealtimeDetector:
 
         metrics = {
             "count": int(len(rows)),
+            # C4：记录评估时部署的阈值，供 check-deploy 核对一致性。
+            "deploy_threshold": (
+                float(self.reference.threshold)
+                if self.reference.threshold is not None
+                else None
+            ),
             "overall_auroc": self._safe_auc(labels, scores),
             "seen_auroc": self._safe_auc(
                 labels[normal_mask | seen_mask],
@@ -532,9 +557,117 @@ class AOIRealtimeDetector:
             "fp": int(fp),
             "fn": int(fn),
             "tp": int(tp),
+            # 3.1：正常分数尺度（std），供 feedback-retrain 的
+            # 尺度感知阈值漂移守卫使用。
+            "normal_score_std": (
+                float(scores[normal_mask].std())
+                if normal_mask.any()
+                else float("nan")
+            ),
             "mean_latency_ms": float(latencies.mean()),
             "p95_latency_ms": float(np.quantile(latencies, 0.95)),
         }
+
+        if threshold_sweep:
+            # C1：区分"模型上限"与"部署点"。
+            # 候选阈值 = 全体分数 1%~99% 分位（99 点）∪ 当前部署阈值。
+            candidate_thresholds = np.unique(
+                np.quantile(scores, np.linspace(0.01, 0.99, 99))
+            )
+            if self.reference.threshold is not None:
+                candidate_thresholds = np.unique(
+                    np.concatenate(
+                        [
+                            candidate_thresholds,
+                            [
+                                float(
+                                    self.reference.threshold
+                                )
+                            ],
+                        ]
+                    )
+                )
+
+            best_point: dict | None = None
+            best_f1 = -1.0
+            for candidate in candidate_thresholds:
+                candidate_predictions = (
+                    scores >= candidate
+                ).astype(int)
+                candidate_f1 = float(
+                    f1_score(
+                        labels,
+                        candidate_predictions,
+                        zero_division=0,
+                    )
+                )
+                if candidate_f1 > best_f1:
+                    best_f1 = candidate_f1
+                    best_point = {
+                        "threshold": float(candidate),
+                        "precision": float(
+                            precision_score(
+                                labels,
+                                candidate_predictions,
+                                zero_division=0,
+                            )
+                        ),
+                        "recall": float(
+                            recall_score(
+                                labels,
+                                candidate_predictions,
+                                zero_division=0,
+                            )
+                        ),
+                        "f1": candidate_f1,
+                    }
+            if best_point is not None:
+                metrics["threshold_sweep"] = {
+                    "best_f1_point": best_point,
+                }
+
+            # P@FPR=target：阈值取正常分的 (1-target_fpr) 分位。
+            normal_scores = scores[normal_mask]
+            if len(normal_scores) > 0:
+                target_fpr = float(
+                    self.config.target_normal_fpr
+                )
+                sweep_threshold = float(
+                    np.quantile(
+                        normal_scores,
+                        1.0 - target_fpr,
+                    )
+                )
+                sweep_predictions = (
+                    scores >= sweep_threshold
+                ).astype(int)
+                metrics.setdefault(
+                    "threshold_sweep",
+                    {},
+                )[
+                    f"precision_at_fpr_{target_fpr}"
+                ] = {
+                    "threshold": sweep_threshold,
+                    "fpr_actual": float(
+                        (
+                            normal_scores >= sweep_threshold
+                        ).mean()
+                    ),
+                    "precision": float(
+                        precision_score(
+                            labels,
+                            sweep_predictions,
+                            zero_division=0,
+                        )
+                    ),
+                    "recall": float(
+                        recall_score(
+                            labels,
+                            sweep_predictions,
+                            zero_division=0,
+                        )
+                    ),
+                }
 
         if output_dir is not None:
             output_path = Path(output_dir)

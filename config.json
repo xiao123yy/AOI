@@ -25,11 +25,11 @@
   "geometry_dims": 6,
   "threshold_quantile": 0.95,
   "public_batch_size": 8,
-  "public_num_workers": 2,
+  "public_num_workers": 4,
   "public_epochs": 5,
   "public_steps_per_epoch": 300,
   "batch_size": 8,
-  "num_workers": 2,
+  "num_workers": 4,
   "head_epochs": 3,
   "stage4_epochs": 3,
   "stage3_epochs": 3,
@@ -38,5 +38,6 @@
   "memory_global_weight": 0.35,
   "color_weight": 0.15,
   "geometry_weight": 0.15,
-  "target_normal_fpr": 0.05
+  "target_normal_fpr": 0.05,
+  "threshold_margin": 1.0
 }
