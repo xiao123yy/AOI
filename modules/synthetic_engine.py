@@ -8,6 +8,53 @@ import numpy as np
 from PIL import Image, ImageEnhance
 
 
+DEFAULT_SCALE_FACTORS = (0.8, 0.9, 1.1, 1.2)
+"""文档建议的尺度干预比例：各向同性与各向异性都会用。"""
+
+
+def random_scale_pair(rng) -> tuple[float, float]:
+    """抽一组 (sx, sy)：50% 各向同性、50% 各向异性，比例来自文档。"""
+    factors = DEFAULT_SCALE_FACTORS
+    try:
+        sx = float(rng.choice(factors))
+        sy = float(rng.choice(factors))
+    except AttributeError:  # random.Random（无 np 风格 choice 情形）
+        sx = float(rng.choice(factors))
+        sy = float(rng.choice(factors))
+    return sx, sy
+
+
+def scale_intervene(
+    image: Image.Image,
+    sx: float,
+    sy: float,
+) -> Image.Image:
+    """无黑边、保持中心、不改变画布尺寸的仿射缩放。
+
+    等价于"镜头变焦/尺子实缩"：绕图像中心按 (sx, sy) 缩放，
+    边缘内容回填（BORDER_REFLECT_101），避免模型学到"黑边=异常"捷径。
+    （尺寸异常检测方法文档的"normal → scale 0.8/0.9/1.1/1.2，
+     保持中心基本不变"的干预构造。）
+    """
+    array = np.asarray(image.convert("RGB"))
+    height, width = array.shape[:2]
+    matrix = np.array(
+        [
+            [sx, 0.0, (1.0 - sx) * width / 2.0],
+            [0.0, sy, (1.0 - sy) * height / 2.0],
+        ],
+        dtype=np.float32,
+    )
+    warped = cv2.warpAffine(
+        array,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+    return Image.fromarray(warped)
+
+
 class SyntheticEngine:
     """
     迁移学习中的辅助数据引擎。
@@ -64,6 +111,7 @@ class SyntheticEngine:
         return image
 
     def geometry(self, image: Image.Image) -> Image.Image:
+        """[旧接口] 保留：整图缩放。新代码请用 scale_intervention（带标签）。"""
         array = np.asarray(image.convert("RGB"))
         height, width = array.shape[:2]
 
@@ -93,6 +141,23 @@ class SyntheticEngine:
         ] = crop
 
         return Image.fromarray(canvas)
+
+    def scale_intervention(
+        self,
+        image: Image.Image,
+    ) -> tuple[Image.Image, Image.Image, float, float]:
+        """尺寸异常合成干预（文档方法）：返回 (干预图, 全图掩码, sx, sy)。
+
+        对正常图做无黑边中心仿射缩放（iso/aniso、比例 0.8/0.9/1.1/1.2），
+        同时给出 (sx, sy) 标签，供 scale_head 学习"相对尺度变化"。
+        """
+        sx, sy = random_scale_pair(self.random)
+        warped = scale_intervene(image, sx, sy)
+        height, width = warped.size
+        mask = Image.fromarray(
+            np.full((height, width), 255, dtype=np.uint8)
+        )
+        return warped, mask, sx, sy
 
     def component_missing(
         self,

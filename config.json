@@ -39,5 +39,7 @@
   "color_weight": 0.15,
   "geometry_weight": 0.15,
   "target_normal_fpr": 0.05,
-  "threshold_margin": 1.0
+  "threshold_margin": 1.0,
+  "public_scale_weight": 0.3,
+  "scale_intervention_probability": 0.12
 }

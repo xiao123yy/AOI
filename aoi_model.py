@@ -80,6 +80,15 @@ class AOIMultiBranchModel(nn.Module):
             nn.Linear(256, geometry_dims),
         )
 
+        # 显式"相对尺度"回归头：输出 log(sx), log(sy)。
+        # 正常图目标 (0,0)，尺度干预合成图目标 (log sx, log sy)；
+        # magnitude = |log-scale| 作为尺寸异常信号接入融合。
+        self.scale_head = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.GELU(),
+            nn.Linear(256, 2),
+        )
+
         self.domain_head = nn.Sequential(
             nn.Linear(768, 128),
             nn.GELU(),
@@ -87,7 +96,7 @@ class AOIMultiBranchModel(nn.Module):
         )
 
         self.fusion_head = nn.Sequential(
-            nn.Linear(6, 32),
+            nn.Linear(7, 32),
             nn.GELU(),
             nn.Linear(32, 1),
         )
@@ -127,6 +136,10 @@ class AOIMultiBranchModel(nn.Module):
         geometry = self.geometry_head(global_feature)
         geometry_magnitude = geometry.abs().mean(dim=1)
 
+        # 尺寸异常信号：|log-scale| 偏离 0 越多，越可能是尺寸偏差。
+        scale_log = self.scale_head(global_feature)
+        scale_magnitude = scale_log.abs().mean(dim=1)
+
         if external_scores is None:
             external_scores = torch.zeros(
                 image.shape[0],
@@ -142,6 +155,7 @@ class AOIMultiBranchModel(nn.Module):
                 global_logit,
                 component_uncertainty,
                 geometry_magnitude,
+                scale_magnitude,
                 external_scores.mean(dim=1),
             ],
             dim=1,
@@ -164,6 +178,7 @@ class AOIMultiBranchModel(nn.Module):
             "global_logit": global_logit,
             "component_logits": component_logits,
             "geometry": geometry,
+            "scale_log": scale_log,
             "domain_logit": domain_logit,
             "features": features,
         }

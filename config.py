@@ -73,6 +73,9 @@ class AOIConfig:
     public_component_weight: float = 0.2
     public_geometry_weight: float = 0.05
     public_rank_weight: float = 0.2
+    # 尺寸/尺度异常：显式 scale 回归头权重 + 公共正常图干预概率。
+    public_scale_weight: float = 0.3
+    scale_intervention_probability: float = 0.12
 
     # Target 100-normal + 30-anomaly transfer.
     batch_size: int = 8

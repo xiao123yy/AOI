@@ -21,7 +21,11 @@ from sklearn.metrics import roc_auc_score
 from config import AOIConfig
 from aoi_model import AOIMultiBranchModel
 from modules.normal_reference import NormalReference
-from modules.synthetic_engine import SyntheticEngine
+from modules.synthetic_engine import (
+    SyntheticEngine,
+    random_scale_pair,
+    scale_intervene,
+)
 from utils.image import (
     geometry_statistics,
     load_rgb,
@@ -118,6 +122,7 @@ class PublicIndustrialDataset(Dataset):
         image = load_rgb(record["path"])
         horizontal_flip = False
         rng = _worker_rng(self)
+        label = float(record["label"])
 
         if self.training:
             horizontal_flip = rng.random() < 0.5
@@ -129,6 +134,25 @@ class PublicIndustrialDataset(Dataset):
             )
             image = ImageEnhance.Contrast(image).enhance(
                 float(rng.uniform(0.9, 1.1))
+            )
+
+        # ── 尺度干预合成（尺寸异常任务，文档方法）──
+        # 对正常图做无黑边中心缩放并给出 (sx, sy) 标签：
+        #   正常样本监督 scale 目标 (0,0)；干预样本监督 (log sx, log sy)；
+        #   真实异常无尺度标签（scale_valid=0，不计损失）。
+        scale_log = np.zeros(2, dtype=np.float32)
+        scale_valid = 1.0 if label == 0.0 else 0.0
+        if (
+            self.training
+            and label == 0.0
+            and rng.random() < self.config.scale_intervention_probability
+        ):
+            sx, sy = random_scale_pair(rng)
+            image = scale_intervene(image, sx, sy)
+            label = 1.0
+            scale_valid = 1.0
+            scale_log = np.array(
+                [np.log(sx), np.log(sy)], dtype=np.float32
             )
 
         geometry = self._cached_geometry(
@@ -150,11 +174,12 @@ class PublicIndustrialDataset(Dataset):
             "image": image_tensor,
             "mask": mask,
             "has_mask": torch.tensor(has_mask, dtype=torch.float32),
-            "label": torch.tensor(
-                float(record["label"]),
-                dtype=torch.float32,
-            ),
+            "label": torch.tensor(label, dtype=torch.float32),
             "geometry": torch.from_numpy(geometry),
+            "scale_log": torch.from_numpy(scale_log),
+            "scale_valid": torch.tensor(
+                scale_valid, dtype=torch.float32
+            ),
             "task_type": str(record.get("task_type", "appearance")),
         }
 
@@ -193,6 +218,10 @@ class TargetDataset(Dataset):
         image = load_rgb(path)
         is_synthetic = 0
         rng = _worker_rng(self)
+        # 尺度标签：正常样本目标 (0,0)、尺度干预合成样本目标 (log sx, log sy)；
+        # appearance/color 合成与真实异常没有尺度标签（valid=0）。
+        scale_log = np.zeros(2, dtype=np.float32)
+        scale_valid = 1.0 if label == 0 else 0.0
 
         if (
             self.training
@@ -205,10 +234,18 @@ class TargetDataset(Dataset):
             )
             if generator == "appearance":
                 image, _ = self.synthetic_engine.appearance(image)
+                scale_valid = 0.0
             elif generator == "color":
                 image = self.synthetic_engine.color(image)
+                scale_valid = 0.0
             else:
-                image = self.synthetic_engine.geometry(image)
+                image, _, sx, sy = (
+                    self.synthetic_engine.scale_intervention(image)
+                )
+                scale_log = np.array(
+                    [np.log(sx), np.log(sy)], dtype=np.float32
+                )
+                scale_valid = 1.0
             label = 1
             is_synthetic = 1
 
@@ -221,6 +258,10 @@ class TargetDataset(Dataset):
             "domain": torch.tensor(float(is_synthetic)),
             "geometry": torch.from_numpy(
                 geometry_statistics(image)
+            ),
+            "scale_log": torch.from_numpy(scale_log),
+            "scale_valid": torch.tensor(
+                float(scale_valid), dtype=torch.float32
             ),
             "path": path,
         }
@@ -446,6 +487,20 @@ class FewShotTransfer:
             output["geometry"],
             geometry_target,
         )
+        # 显式尺度回归损失：只对 normal（目标 0）与
+        # 尺度干预合成图（目标 log sx, log sy）监督。
+        scale_valid = (
+            batch["scale_valid"].to(self.config.device).bool()
+        )
+        if scale_valid.any():
+            scale_log_loss = F.smooth_l1_loss(
+                output["scale_log"][scale_valid],
+                batch["scale_log"].to(self.config.device)[
+                    scale_valid
+                ],
+            )
+        else:
+            scale_log_loss = classification.new_tensor(0.0)
         ranking = _ranking_loss(
             output["final_logit"],
             labels,
@@ -458,6 +513,7 @@ class FewShotTransfer:
             + self.config.public_segmentation_weight * segmentation
             + self.config.public_component_weight * component_loss
             + self.config.public_geometry_weight * geometry_loss
+            + self.config.public_scale_weight * scale_log_loss
             + self.config.public_rank_weight * ranking
         )
 
@@ -468,6 +524,7 @@ class FewShotTransfer:
             "segmentation": float(segmentation.detach().cpu()),
             "component": float(component_loss.detach().cpu()),
             "geometry": float(geometry_loss.detach().cpu()),
+            "scale": float(scale_log_loss.detach().cpu()),
             "ranking": float(ranking.detach().cpu()),
         }
         return loss, parts
@@ -849,6 +906,22 @@ class FewShotTransfer:
                         output["geometry"],
                         batch["geometry"].to(self.config.device),
                     )
+                    # 显式尺度回归损失（适配阶段）：
+                    # normal 目标 0、尺度干预合成图目标 log(sx,sy)，
+                    # appearance/color 合成与真实异常无尺度标签（valid=0）。
+                    scale_valid = (
+                        batch["scale_valid"]
+                        .to(self.config.device)
+                        .bool()
+                    )
+                    if scale_valid.any():
+                        scale_log_loss = F.smooth_l1_loss(
+                            output["scale_log"][scale_valid],
+                            batch["scale_log"]
+                            .to(self.config.device)[scale_valid],
+                        )
+                    else:
+                        scale_log_loss = classification.new_tensor(0.0)
                     loss = (
                         classification
                         + 0.25 * global_loss
@@ -856,6 +929,7 @@ class FewShotTransfer:
                         + 0.05 * domain_loss
                         + 0.2 * component_loss
                         + 0.05 * geometry_loss
+                        + self.config.public_scale_weight * scale_log_loss
                     )
 
                 scaler.scale(loss).backward()
