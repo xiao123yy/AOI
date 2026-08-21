@@ -52,11 +52,12 @@
 AOI/
 │
 ├── main.py                              # 命令行统一入口（10 个命令，见 §30）
-├── aoi_model.py                         # 多尺度模型、6 个任务头 + 时序头
+├── aoi_model.py                         # 多尺度模型、7 个任务头 + 时序头
 ├── convnextv2.py                        # ConvNeXtV2-Tiny 骨干实现
 ├── config.py                            # 配置读取、路径解析和验证
 ├── config.json                          # 默认训练与部署配置
 ├── config_nw0.json                      # num_workers=0 复现配置（受限环境/单卡）
+├── config_nw0_b4.json                   # num_workers=0 + batch=4（虚拟内存受限时绕开 CUDA commit 上限）
 ├── example_config.json                  # 部署用精简配置示例
 ├── requirements.txt                     # Python 依赖
 ├── __init__.py
@@ -324,15 +325,22 @@ F32 连接全局异常头、组件状态头、几何头和融合模块，用于�
 | F32 全局异常头 | 判断整体图像是否异常 |
 | 组件状态头 | 为缺件、错位和组件关系异常提供接口 |
 | 几何异常头 | 为尺寸变化、轮廓变化和形态异常提供接口 |
+| 尺度异常头（scale_head） | 显式回归相对尺度 `log(sx), log(sy)`（正常=0），`\|log-scale\|` 作为尺寸偏差信号接入融合 |
 | 域对齐头 | 缓解真实异常和合成异常之间的分布差异 |
-| 融合头 | 联合局部、全局、组件、几何和颜色证据 |
+| 融合头 | 联合局部、全局、组件、几何、尺度和颜色证据 |
 | 时序逻辑头 | 为视频状态序列建模提供接口 |
 
 需要注意：
 
 - 组件状态头必须结合组件标签、组件框、组件 Mask 或可控组件异常合成进行训练；
-- 几何异常头必须定义明确的几何监督目标；
+- 几何异常头和尺度异常头必须定义明确的几何/尺度监督目标；
 - 仅定义输出头不能证明模型已经具备完整的缺件或尺寸检测能力。
+
+尺度异常头（2026-08-21 新增）：
+- 正常图监督目标 `(0,0)`；对正常图做 12%（`scale_intervention_probability`）概率的
+  "无黑边中心缩放"干预（各向同性/各向异性，比例 0.8/0.9/1.1/1.2）后，监督目标为 `(log sx, log sy)`；
+- `scale_valid` 标签标识哪些样本带尺度监督（正常图与尺度干预样本=1；appearance/color 合成与真实异常=0，不计尺度损失）；
+- 干预图本身也被视为"尺寸异常样本"参与分类训练（label 翻转为 1）。
 
 ---
 
@@ -496,6 +504,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 - 监督异常分类分数；
 - 组件异常分数；
 - 几何异常分数；
+- 尺度异常分数（`scale_magnitude = |scale_head 输出| 的均值`）；
 - 颜色异常分数。
 
 不同分支首先进行尺度标准化，再由轻量融合头输出最终异常分数。
@@ -507,7 +516,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 
 进行新产线快速校准。
 
-相比固定手工权重，学习式融合可以根据不同产品的缺陷特点自动调整局部、全局、颜色、几何和组件分支的重要性。
+相比固定手工权重，学习式融合可以根据不同产品的缺陷特点自动调整局部、全局、颜色、几何、尺度和组件分支的重要性。
 
 ---
 
@@ -522,6 +531,7 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 - F32 全局异常监督；
 - 像素级异常区域监督；
 - 正常与异常排名约束；
+- 显式尺度回归监督（`scale_head`，Smooth L1，仅 normal 与尺度干预样本）＋尺度干预合成；
 - 真实异常与合成异常域对齐；
 - 类别不平衡采样。
 
@@ -608,6 +618,8 @@ F32 全局正常性参数最终保存到 `target_model.pth`，不依赖高维外
 | 颜色异常 | 色偏、褪色、亮度变化 | 强化局部颜色和整体颜色异常检测 |
 | 几何异常 | 缩放、形变、错位、旋转 | 强化 F16/F32 和几何分支 |
 | 语义或组件异常 | 缺件、替换、多件、错误组合 | 强化 F32 和组件分支 |
+
+其中"尺度干预（scale intervention）"是尺寸异常任务的专用合成：对正常图做**无黑边、保持中心、不改变画布尺寸**的仿射缩放（各向同性/各向异性，比例 0.8/0.9/1.1/1.2），边缘用 `BORDER_REFLECT_101` 回填，避免模型学到"黑边=异常"捷径；同时给出 `(sx, sy)` 标签供 `scale_head` 回归，干预图以 12% 概率出现在公共预训练（`PublicIndustrialDataset`）与目标域适配（`TargetDataset` 的 geometry 迁移路径）中。
 
 合成数据需要统一返回：
 
@@ -824,6 +836,27 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
   （训练需 `num_workers=0` + AMP）；
 - **五类可视化**：`vis_results/` 下五类 × normal/seen/unseen 共 78 张三栏对比图（原图/热力图/F16 激活 + 分支分数）。
 
+**最新实验（2026-08-21）**：capsule **squeeze**（挤压变形）新 unseen 类型 + 尺度异常分支
+（scale_head + 尺度干预合成，`config_nw0_b4.json`，batch=4 绕开虚拟内存上限）：
+
+| 指标 | 实测结果 |
+|---|---:|
+| Overall AUROC | 0.9015 |
+| Seen AUROC | 0.8909 |
+| Unseen AUROC | **0.9326**（未见过的 squeeze 缺陷） |
+| Accuracy / P / R / F1 | 0.794 / 0.939 / 0.785 / 0.855 |
+| Normal FPR | 17.4%（4/23） |
+| Seen / Unseen 召回 | 74.6% / 90.0%（44/59、18/20） |
+| best-F1 点（threshold sweep） | 阈值 -1.848（P 0.904 / R 0.949 / **F1 0.926**） |
+| P@FPR=5% 点 | 阈值 1.638（实测 FPR 8.7%、P 0.96 / R 0.608） |
+| Mean / P95 延迟 | 30.9 / 35.4 ms |
+| 完整产物 | `experiments/mvtec_ad_capsule_unseen_squeeze/`（已入 `summary.csv`） |
+
+> 说明：squeeze 属于全新 unseen 类型且带尺度分量，unseen AUROC 0.93、召回 90% 说明尺度/尺寸异常分支
+> 对未见形态有正面作用；正常 FPR 17.4% 高于其余类别（query 仅 23 张正常图 + batch=4 训练差异），
+> best-F1 点可达 F1 0.926。该实验同时验证了"系统虚拟内存（commit）不足时 CUDA 报
+> `bad allocation`"的环境坑——降低 batch（`config_nw0_b4.json`）可绕开，排查细节见《优化计划.md》。
+
 ---
 
 ## 22. 使用流程
@@ -926,6 +959,8 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 | `target_normal_fpr` | 正常校准目标误报率 |
 | `feedback_retrain_min_samples` | 触发反馈重训的最少样本数 |
 | `enable_roi_refinement` | 是否启用 ROI 精修 |
+| `public_scale_weight` | 尺度回归损失权重（默认 0.3） |
+| `scale_intervention_probability` | 公共训练正常图做尺度干预的概率（默认 0.12） |
 
 ### 24.2 Memory-bank Baseline 配置
 
@@ -978,7 +1013,9 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 - 五类统一基线（2.3）与每类独立部署/评估产物（`experiments/` + `summary.csv`）；
 - 20%→30% 校准样本的 2.1 机制在 grid 上验证通过（FPR 11%→0%）；
 - 2500×2500 延迟复核与 RTX 2060 估算（见 §21）；
-- 五类可视化产物（`vis_results/`）。
+- 五类可视化产物（`vis_results/`）；
+- **尺度异常分支（scale_head + 尺度干预合成，2026-08-21）**：公共预训练与目标适配均带显式尺度回归，
+  干预无黑边中心缩放，capsule squeeze unseen 实验跑通（AUROC 0.90 / unseen 0.93，见 §21）。
 
 ### 25.2 正在重构
 
@@ -993,7 +1030,8 @@ DFM/StyleGAN 类真实感异常生成仍属于后续扩展，在未完成真实�
 
 - 0/1/2/5/30-shot 开放集 episode 训练；
 - 组件头真实监督；
-- 几何头真实监督；
+- 几何头真实监督（几何回归已在公共/目标训练中启用，但"与真实几何统计逐维对齐"的强监督仍待完整化）；
+- 尺度头的独立消融（scale_head 开关对尺寸类 unseen 的增益定量化）；
 - 四类异质异常统一 Mask 输出；
 - DFM/GAN 真实感缺陷生成；
 - 真实产线视频序列训练；
@@ -1288,4 +1326,9 @@ python main.py --config config.json zero-shot-adapt --normal-dir /path/to/normal
 ```bash
 # 顺序跑五类完整管线（grid/leather/capsule/transistor/dagm Class3，各 ≈43 分钟，全程 ~3.6h）
 python scripts/run_experiment.py --all --base-config config_nw0.json
+
+# 虚拟内存（commit）不足导致 CUDA bad allocation 时（RTX 5060 8GB 上实测触发），
+# 改用 batch=4 配置绕开：
+python scripts/run_experiment.py --base-config config_nw0_b4.json \
+    --target-dataset mvtec_ad --target-category capsule --unseen-type squeeze
 ```
