@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import csv
 import json
 import time
@@ -22,6 +23,7 @@ from sklearn.metrics import (
 from config import AOIConfig
 from aoi_model import AOIMultiBranchModel, TemporalLogicHead
 from modules.normal_reference import NormalReference
+from modules.missing_fewer_e7 import MissingFewerReference
 from utils.image import (
     geometry_statistics_array,
     lab_statistics_array,
@@ -49,15 +51,26 @@ class AOIRealtimeDetector:
         model: AOIMultiBranchModel,
         reference: NormalReference,
         temporal_head: TemporalLogicHead | None = None,
+        missing_fewer_reference: MissingFewerReference | None = None,
     ):
         self.config = config
         self.model = model.to(config.device).eval()
         self.reference = reference
+        self.missing_fewer_reference = missing_fewer_reference.to(config.device) if missing_fewer_reference is not None else None
+        self._missing_fewer_backbone_identity: str | None = None
         self.temporal_head = (
             temporal_head.to(config.device).eval()
             if temporal_head is not None
             else None
         )
+
+    def _e7_backbone_identity(self) -> str:
+        if self._missing_fewer_backbone_identity is None:
+            digest = hashlib.sha256()
+            for name, value in sorted(self.model.backbone.state_dict().items()):
+                digest.update(name.encode("utf-8")); digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+            self._missing_fewer_backbone_identity = digest.hexdigest()
+        return self._missing_fewer_backbone_identity
 
     def _synchronize(self) -> None:
         if self.config.device.startswith("cuda"):
@@ -174,6 +187,21 @@ class AOIRealtimeDetector:
         global_forward_ms = float(
             global_result["elapsed_ms"]
         )
+
+        # Reuse the sole global forward's E7 tokens.  E7 remains separate from
+        # existing fusion and is therefore safe to deploy independently.
+        missing_fewer: dict | None = None
+        if self.missing_fewer_reference is not None:
+            core = self.model.missing_fewer_core
+            if core is None:
+                raise RuntimeError("Deployment reference contains E7 but E7 is disabled.")
+            e7_start = time.perf_counter()
+            e7 = core.score_tokens(global_output["missing_fewer_tokens"], self.missing_fewer_reference, self._e7_backbone_identity())
+            e7_score = float(e7["score"][0].detach().cpu())
+            threshold_e7 = self.missing_fewer_reference.threshold
+            missing_fewer = {"score": e7_score, "threshold": threshold_e7, "is_anomaly": None if threshold_e7 is None else bool(e7_score >= threshold_e7), "latency_ms": (time.perf_counter() - e7_start) * 1000.0}
+            if self.config.missing_fewer_debug_energies:
+                missing_fewer["energies"] = {key: float(value[0].detach().cpu()) for key, value in e7.items() if key not in {"score", "tail_struct", "tail_composition"}}
 
         supervised_global = float(
             global_output[
@@ -428,6 +456,7 @@ class AOIRealtimeDetector:
                 dominant_branch
             ),
             "branch_scores": branch_scores,
+            "missing_fewer": missing_fewer,
             "roi_boxes": boxes,
             "roi_scores": roi_scores,
             "latency_ms": float(total_ms),
@@ -489,6 +518,10 @@ class AOIRealtimeDetector:
                 "threshold": float(result["threshold"]),
                 "latency_ms": float(result["latency_ms"]),
                 "dominant_branch": result["dominant_branch"],
+                "missing_fewer_score": (
+                    None if result["missing_fewer"] is None
+                    else float(result["missing_fewer"]["score"])
+                ),
             })
             if index % 20 == 0 or index == len(items):
                 print(f"[evaluate] {index}/{len(items)}")
@@ -804,3 +837,12 @@ class AOIRealtimeDetector:
             "threshold": threshold,
             "is_anomaly": bool(final_score >= threshold),
         }
+        if self.missing_fewer_reference is not None:
+            e7_scores = np.asarray([row["missing_fewer_score"] for row in rows], dtype=float)
+            metrics["missing_fewer_e7"] = {
+                "threshold": self.missing_fewer_reference.threshold,
+                "policy": self.missing_fewer_reference.threshold_policy,
+                "overall_auroc": self._safe_auc(labels, e7_scores),
+                "seen_auroc": self._safe_auc(labels[normal_mask | seen_mask], e7_scores[normal_mask | seen_mask]),
+                "unseen_auroc": self._safe_auc(labels[normal_mask | unseen_mask], e7_scores[normal_mask | unseen_mask]),
+            }

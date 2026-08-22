@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 import json
+import hashlib
 from typing import Any, Iterable
 
 import cv2
@@ -21,6 +22,7 @@ from sklearn.metrics import roc_auc_score
 from config import AOIConfig
 from aoi_model import AOIMultiBranchModel
 from modules.normal_reference import NormalReference
+from modules.missing_fewer_e7 import MissingFewerReference
 from modules.synthetic_engine import (
     SyntheticEngine,
     random_scale_pair,
@@ -320,6 +322,114 @@ class FewShotTransfer:
         self.config = config
         self.model = model.to(config.device)
         self.reference = NormalReference(config)
+        self.missing_fewer_reference: MissingFewerReference | None = None
+
+    # ------------------------------------------------------------------
+    # Frozen R0+E7 Missing/Fewer lifecycle.  It is intentionally separate
+    # from the legacy target fine-tuning pathway: 100N builds a reference,
+    # while 30A calibrates only a threshold.
+    # ------------------------------------------------------------------
+    def _missing_fewer_identity(self) -> str:
+        digest = hashlib.sha256()
+        for name, value in sorted(self.model.backbone.state_dict().items()):
+            digest.update(name.encode("utf-8"))
+            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+        return digest.hexdigest()
+
+    def _frozen_missing_fewer_features(self, paths: Iterable[str | Path]) -> tuple[torch.Tensor, str]:
+        if self.model.missing_fewer_core is None:
+            raise RuntimeError("Missing/Fewer E7 is disabled by configuration.")
+        self.model.eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        batches: list[torch.Tensor] = []
+        with torch.inference_mode():
+            for path in paths:
+                image = normalize_image(load_rgb(path), self.config.global_size)
+                # Exactly one AOI model forward per image; E7 reuses its tokens.
+                output = self.model(image[None].to(self.config.device))
+                batches.append(output["missing_fewer_tokens"].detach().cpu())
+        if not batches:
+            raise ValueError("Missing/Fewer reference/scoring needs at least one image.")
+        return torch.cat(batches, dim=0), self._missing_fewer_identity()
+
+    def build_missing_fewer_reference(self, normal_paths: Iterable[str | Path], output_path: str | Path | None = None) -> MissingFewerReference:
+        normal_paths = list(normal_paths)
+        if len(normal_paths) < 5:
+            raise ValueError("E7 needs at least five target normal images.")
+        tokens, identity = self._frozen_missing_fewer_features(normal_paths)
+        core = self.model.missing_fewer_core
+        assert core is not None
+        self.missing_fewer_reference = core.build_reference(tokens, identity, self.config.missing_fewer_tail_folds)
+        if output_path is not None:
+            self.missing_fewer_reference.save(output_path)
+        return self.missing_fewer_reference
+
+    def score_missing_fewer(self, paths: Iterable[str | Path]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        if self.missing_fewer_reference is None:
+            raise RuntimeError("Build/load the E7 100-normal reference first.")
+        tokens, identity = self._frozen_missing_fewer_features(paths)
+        core = self.model.missing_fewer_core
+        assert core is not None
+        result = core.score_tokens(tokens.to(self.config.device), self.missing_fewer_reference, identity)
+        return result["score"].detach().cpu().numpy(), {
+            name: value.detach().cpu().numpy() for name, value in result.items() if name != "score"
+        }
+
+    def calibrate_missing_fewer_threshold(self, normal_paths: Iterable[str | Path], anomaly_paths: Iterable[str | Path], policy: str | None = None) -> float:
+        if self.missing_fewer_reference is None:
+            raise RuntimeError("Build the E7 reference before 30A calibration.")
+        core = self.model.missing_fewer_core
+        assert core is not None
+        before = hashlib.sha256(b"".join(v.detach().cpu().numpy().tobytes() for v in core.state_dict().values())).hexdigest()
+        normal_scores, _ = self.score_missing_fewer(normal_paths)
+        anomaly_scores, _ = self.score_missing_fewer(anomaly_paths)
+        core.calibrate_threshold(torch.as_tensor(normal_scores, device=self.config.device), torch.as_tensor(anomaly_scores, device=self.config.device), self.missing_fewer_reference, policy or self.config.missing_fewer_threshold_policy, self.config.target_normal_fpr)
+        after = hashlib.sha256(b"".join(v.detach().cpu().numpy().tobytes() for v in core.state_dict().values())).hexdigest()
+        if before != after:
+            raise RuntimeError("30A must not modify E7 structure parameters.")
+        return float(self.missing_fewer_reference.threshold)
+
+    def pretrain_missing_fewer_public(self, train_records: list[dict[str, Any]], output_path: str | Path, epochs: int | None = None, steps_per_epoch: int | None = None, held_out_category: str = "") -> None:
+        """LOPO normal-only public training for the E7 structural core."""
+        if self.model.missing_fewer_core is None:
+            raise RuntimeError("Missing/Fewer E7 is disabled by configuration.")
+        records = [r for r in train_records if float(r.get("label", 0.0)) == 0.0]
+        if held_out_category and any(held_out_category.lower() in str(r).lower() for r in records):
+            raise ValueError("LOPO leakage: held-out target appears in public records.")
+        if len(records) < 2:
+            raise ValueError("E7 public training needs at least two public normal images.")
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        core = self.model.missing_fewer_core.to(self.config.device).train()
+        for parameter in core.parameters():
+            parameter.requires_grad = True
+        loader = DataLoader(PublicIndustrialDataset(records, self.config, training=True), batch_size=self.config.public_batch_size, shuffle=True, drop_last=True, num_workers=self.config.public_num_workers)
+        optimizer = torch.optim.AdamW(core.parameters(), lr=self.config.public_lr_head, weight_decay=self.config.public_weight_decay)
+        epochs = epochs or self.config.public_epochs
+        steps_per_epoch = steps_per_epoch or self.config.public_steps_per_epoch
+        iterator = iter(loader)
+        for epoch in range(epochs):
+            total = 0.0
+            for _ in range(steps_per_epoch):
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    iterator = iter(loader); batch = next(iterator)
+                image = batch["image"].to(self.config.device)
+                with torch.no_grad():
+                    features = self.model.backbone(image)
+                    f16, f32 = features["f16"], features["f32"]
+                theta = image.new_zeros((len(image), 2, 3)); theta[:, 0, 0] = 1; theta[:, 1, 1] = 1
+                theta[:, :, 2] = torch.empty(len(image), 2, device=image.device).uniform_(-.03, .03)
+                f16_geo = F.grid_sample(f16, F.affine_grid(theta, f16.shape, align_corners=False), align_corners=False, padding_mode="border")
+                f32_geo = F.grid_sample(f32, F.affine_grid(theta, f32.shape, align_corners=False), align_corners=False, padding_mode="border")
+                order = torch.randperm(len(image), device=image.device)
+                loss = core.public_loss(f16, f32, f16[order], f32[order], f16_geo, f32_geo, theta, self.config.missing_fewer_public_weight, self.config.missing_fewer_public_margin)["total"]
+                optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step(); total += float(loss.detach())
+            print(f"[e7 public] epoch={epoch + 1}/{epochs} loss={total / steps_per_epoch:.6f}")
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": self.model.state_dict(), "missing_fewer_public": {"lopo_held_out": held_out_category, "backbone_frozen": True, "has_target_reference": False, "version": "e7_r0"}}, output_path)
 
     def _autocast(self):
         if self.config.device.startswith("cuda") and self.config.amp:

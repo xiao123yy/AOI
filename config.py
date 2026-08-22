@@ -77,6 +77,23 @@ class AOIConfig:
     public_scale_weight: float = 0.3
     scale_intervention_probability: float = 0.12
 
+    # Frozen R0 + E7 Missing/Fewer protocol. Public training changes only the
+    # E7 core; 100N builds the product reference and 30A calibrates a boundary.
+    missing_fewer_enabled: bool = True
+    missing_fewer_public_enabled: bool = True
+    missing_fewer_token_dim: int = 192
+    missing_fewer_grid_size: int = 12
+    missing_fewer_projection_count: int = 64
+    missing_fewer_histogram_bins: int = 32
+    missing_fewer_projection_seed: int = 31415
+    missing_fewer_histogram_temperature: float = 0.08
+    missing_fewer_public_weight: float = 0.5
+    missing_fewer_public_margin: float = 0.02
+    missing_fewer_tail_folds: int = 5
+    missing_fewer_top_ratio: float = 0.05
+    missing_fewer_threshold_policy: str = "auto"
+    missing_fewer_debug_energies: bool = False
+
     # Target 100-normal + 30-anomaly transfer.
     batch_size: int = 8
     num_workers: int = 4

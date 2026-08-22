@@ -12,6 +12,7 @@ from aoi_model import AOIMultiBranchModel, TemporalLogicHead
 from modules.feedback_optimization import FeedbackOptimizer
 from modules.fewshot_transfer import FewShotTransfer
 from modules.normal_reference import NormalReference
+from modules.missing_fewer_e7 import MissingFewerReference
 from modules.realtime_detection import AOIRealtimeDetector
 from modules.synthetic_engine import SyntheticEngine
 from utils.paths import (
@@ -31,6 +32,7 @@ def build_model(
         geometry_dims=config.geometry_dims,
         local_top_ratio=config.local_top_ratio,
         backbone_mode=config.backbone_mode,
+        enable_missing_fewer=config.missing_fewer_enabled,
     )
 
     if full_checkpoint is None:
@@ -113,6 +115,11 @@ def load_deployed(
     return model, reference
 
 
+def load_missing_fewer_reference(config: AOIConfig) -> MissingFewerReference | None:
+    path = config.workspace_path / "deployment" / "missing_fewer_e7_reference.pth"
+    return MissingFewerReference.load(path, config.device) if path.exists() else None
+
+
 def command_make_split(args, config: AOIConfig) -> None:
     split_dir = build_public_and_target_split(
         config=config,
@@ -146,13 +153,10 @@ def command_pretrain_public(args, config: AOIConfig) -> None:
 
     model = build_model(config)
     transfer = FewShotTransfer(config, model)
-    transfer.pretrain_public(
-        train_records=train_records,
-        validation_records=validation_records,
-        output_path=config.industrial_checkpoint_path,
-        epochs=args.epochs,
-        steps_per_epoch=args.steps_per_epoch,
-    )
+    if args.missing_fewer_e7:
+        transfer.pretrain_missing_fewer_public(train_records, config.industrial_checkpoint_path, args.epochs, args.steps_per_epoch, args.held_out_category)
+    else:
+        transfer.pretrain_public(train_records=train_records, validation_records=validation_records, output_path=config.industrial_checkpoint_path, epochs=args.epochs, steps_per_epoch=args.steps_per_epoch)
 
 
 def command_adapt(args, config: AOIConfig) -> None:
@@ -178,20 +182,17 @@ def command_adapt(args, config: AOIConfig) -> None:
     deployment_dir = config.workspace_path / "deployment"
     deployment_dir.mkdir(parents=True, exist_ok=True)
 
-    synthetic_engine = (
-        None
-        if args.disable_synthetic
-        else SyntheticEngine(seed=42)
-    )
-    transfer.adapt(
-        normal_paths=normal_paths,
-        anomaly_paths=anomaly_paths,
-        output_model_path=deployment_dir / "target_model.pth",
-        output_reference_path=(
-            deployment_dir / "normal_reference.pth"
-        ),
-        synthetic_engine=synthetic_engine,
-    )
+    if args.missing_fewer_e7:
+        # E7 target adaptation is frozen: 100N reference then 30A boundary only.
+        transfer.build_zero_shot_reference(normal_paths, deployment_dir / "normal_reference.pth")
+        transfer.build_missing_fewer_reference(normal_paths, deployment_dir / "missing_fewer_e7_reference.pth")
+        transfer.calibrate_missing_fewer_threshold(normal_paths, anomaly_paths, args.e7_policy)
+        assert transfer.missing_fewer_reference is not None
+        transfer.missing_fewer_reference.save(deployment_dir / "missing_fewer_e7_reference.pth")
+        torch.save(model.state_dict(), deployment_dir / "target_model.pth")
+    else:
+        synthetic_engine = None if args.disable_synthetic else SyntheticEngine(seed=42)
+        transfer.adapt(normal_paths=normal_paths, anomaly_paths=anomaly_paths, output_model_path=deployment_dir / "target_model.pth", output_reference_path=deployment_dir / "normal_reference.pth", synthetic_engine=synthetic_engine)
 
 
 def command_evaluate(args, config: AOIConfig) -> None:
@@ -200,6 +201,7 @@ def command_evaluate(args, config: AOIConfig) -> None:
         config=config,
         model=model,
         reference=reference,
+        missing_fewer_reference=load_missing_fewer_reference(config),
     )
     normal_paths = list_images(args.normal_dir)
     seen_paths = (
@@ -372,6 +374,7 @@ def command_infer_image(args, config: AOIConfig) -> None:
         config=config,
         model=model,
         reference=reference,
+        missing_fewer_reference=load_missing_fewer_reference(config),
     )
     result = detector.inspect_image(args.image)
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -532,6 +535,8 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
+    public.add_argument("--missing-fewer-e7", action="store_true", help="Run frozen-backbone E7 public core only")
+    public.add_argument("--held-out-category", default="", help="LOPO target category excluded from public records")
     public.set_defaults(function=command_pretrain_public)
 
     adapt = subparsers.add_parser(
@@ -544,6 +549,8 @@ def create_parser() -> argparse.ArgumentParser:
         "--disable-synthetic",
         action="store_true",
     )
+    adapt.add_argument("--missing-fewer-e7", action="store_true", help="Frozen E7 100N reference + 30A threshold calibration")
+    adapt.add_argument("--e7-policy", default="auto", choices=["auto", "f1", "balanced_accuracy", "target_fpr"])
     adapt.set_defaults(function=command_adapt)
 
     evaluate = subparsers.add_parser(

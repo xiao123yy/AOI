@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from convnextv2 import load_convnextv2_tiny
 from modules.c2_ffn_convnext_v1 import load_c2_ffn_convnext_v1
+from modules.missing_fewer_e7 import MissingFewerE7
 
 
 class GradientReversal(torch.autograd.Function):
@@ -41,6 +42,7 @@ class AOIMultiBranchModel(nn.Module):
         geometry_dims: int = 6,
         local_top_ratio: float = 0.01,
         backbone_mode: str = "dense",
+        enable_missing_fewer: bool = True,
     ):
         super().__init__()
         if backbone_mode in ("dense", "standard"):
@@ -54,6 +56,11 @@ class AOIMultiBranchModel(nn.Module):
             raise ValueError(f"Unknown backbone_mode: {backbone_mode}")
         self.backbone_mode = backbone_mode
         self.local_top_ratio = local_top_ratio
+        # Independent E7 core; it consumes the F16/F32 tensors below and never
+        # invokes the shared ConvNeXt backbone by itself.
+        self.missing_fewer_core = (
+            MissingFewerE7() if enable_missing_fewer else None
+        )
 
         self.local_head = nn.Sequential(
             nn.Conv2d(384, 192, kernel_size=1),
@@ -181,7 +188,17 @@ class AOIMultiBranchModel(nn.Module):
             "scale_log": scale_log,
             "domain_logit": domain_logit,
             "features": features,
+            "missing_fewer_tokens": (
+                self.missing_fewer_core.encode(f16, f32)
+                if self.missing_fewer_core is not None else None
+            ),
         }
+
+    def encode_missing_fewer(self, f16: torch.Tensor, f32: torch.Tensor) -> torch.Tensor:
+        """Build E7 tokens from a caller's existing one-pass features."""
+        if self.missing_fewer_core is None:
+            raise RuntimeError("Missing/Fewer E7 is disabled by configuration.")
+        return self.missing_fewer_core.encode(f16, f32)
 
 
 class TemporalLogicHead(nn.Module):
